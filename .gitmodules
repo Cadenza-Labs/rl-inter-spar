@@ -1,0 +1,3 @@
+[submodule "nice-hooks"]
+	path = nicehooks
+	url = https://github.com/BorisTheBrave/nice-hooks
