@@ -1,9 +1,41 @@
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_atari_env
+from stable_baselines3.common.vec_env import VecFrameStack
+import nicehooks.nice_hooks as nice_hooks
 from sb3_extract import obs_to_tensor, sb3_preprocess, get_activations, get_extractor_activation
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils import data as data_th
 import copy
 import numpy as np
+from typing import Sequence
+from imitation.data.rollout import generate_trajectories, make_sample_until
+
+
+
+def generate_dataset(env_name, model_name, num_episodes, num_envs, seed):
+    model = load_model(model_name)
+    env = make_atari_env(env_name, n_envs=num_envs)
+    env = VecFrameStack(env, n_stack=4)
+    # TODO add model or env wrapper to align obs shapes
+    trajectories = generate_trajectories(model, env, make_sample_until(min_episodes=num_episodes), np.random.default_rng(seed))
+    return trajectories
+
+
+def load_data(model_name, val_fraction, seed):
+    dataset = load_dataset(model_name)
+    val_length = int(len(dataset) * val_fraction)
+    train_length = len(dataset) - val_length
+    train_dataset, val_dataset = data_th.random_split(
+        dataset,
+        lengths=[train_length, val_length],
+        generator=torch.Generator().manual_seed(42),
+    )
+    return train_dataset, val_dataset
+
+def load_model(model_name):
+    return PPO.load(f'agents/{model_name}', device='cpu')
 
 def get_preprocessed_value_estimate(model, obs):
     pass
@@ -29,8 +61,7 @@ class MLPProbe(nn.Module):
 class SupervisedTraining:
     def __init__(self, model_name):
         model = load_model(model_name)
-        data = load_trajectories(model_name)
-        test_data, train_data = split_data(data)
+        train_data, test_data = load_data(model_name)
 
 
 class CCS:
@@ -48,8 +79,7 @@ class CCS:
         self.weight_decay = weight_decay
         
         self.model = load_model(model_name)
-        self.data = load_trajectories(model_name)
-        self.test_data, self.train_data = split_data(data)
+        self.train_data, self.test_data = load_data(model_name)
 
         # TODO vectorize this
         self.train_activations1, self.train_activations2 = get_hidden_activations(train_data)
@@ -61,13 +91,12 @@ class CCS:
         self.probe = MLPProbe(self.d)
         self.probe.to(self.device)    
 
-    def normalize(self, x):
-        # TODO discuss whether we need this at all
+    def normalize(self, activations):
         """
         Mean-normalizes the data x (of shape (n, d))
         If self.var_normalize, also divides by the standard deviation
         """
-        normalized_x = x - x.mean(axis=0, keepdims=True)
+        normalized_x = activations - activations.mean(axis=0, keepdims=True)
         if self.var_normalize:
             normalized_x /= normalized_x.std(axis=0, keepdims=True)
 
@@ -77,20 +106,24 @@ class CCS:
         """
         Returns the CCS loss for two values each of shape (n,1) or (n,)
         """
-        # TODO discuss correct losses
-        # informative_loss = (torch.min(value_1, p1)**2).mean(0)
+        # TODO add more loss options
+        informative_loss = (torch.min((1 - value_1)**2, (1 - value_2)**2)).mean(0)
         consistent_loss = ((value_1 + value_2)**2).mean(0)
-        return consistent_loss
+        return consistent_loss + informative_loss
 
     def get_acc(self, x0_test, x1_test, y_test):
         """
         Computes accuracy for the current parameters on the given test inputs
         """
+        # TODO normalize data in one call
         x0 = torch.tensor(self.normalize(x0_test), dtype=torch.float, requires_grad=False, device=self.device)
         x1 = torch.tensor(self.normalize(x1_test), dtype=torch.float, requires_grad=False, device=self.device)
         with torch.no_grad():
             value_1, value_2 = self.best_probe(x0), self.best_probe(x1)
         # TODO discuss whether we need this / can compute it
+        # - compare with value network if applicable
+        # - compare with expected returns from trajectories
+
         # avg_confidence = 0.5*(p0 + (1-p1))
         #predictions = (avg_confidence.detach().cpu().numpy() < 0.5).astype(int)[:, 0]
         #acc = (predictions == y_test).mean()
@@ -144,11 +177,14 @@ class CCS:
 
 
 if __name__ == "__main__":
+    env_name = "PongNoFrameskip-v4"
+    model_name = "ppo-PongNoFrameskip-v4"
+    # Generate dataset
+    trajs = generate_dataset(env_name, model_name, num_episodes=10, num_envs=4, seed=42)
     # Train CCS without any labels
     ccs = CCS(model_name="ppo-PongNoFrameskip-v4")
     ccs.repeated_train()
 
-    # TODO think about how to evaluate!?
     # Evaluate
     # ccs_acc = ccs.get_acc(neg_hs_test, pos_hs_test, y_test)
     # print("CCS accuracy: {}".format(ccs_acc))
