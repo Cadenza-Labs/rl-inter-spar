@@ -2,3 +2,6 @@ stable_baselines3
 opencv-python
 ipykernel
 imitation
+pettingzoo
+supersuit
+huggingface_hub
