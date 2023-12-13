@@ -5,5 +5,5 @@
 ```
 conda create -n spar python==3.10
 conda activate spar
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
