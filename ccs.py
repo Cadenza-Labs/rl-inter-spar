@@ -4,6 +4,7 @@ from pathlib import Path
 import pickle
 import torch.nn as nn
 from torch.utils import data as data_th
+from torch.utils.data import DataLoader
 import torch as th
 import copy
 import numpy as np
@@ -293,24 +294,16 @@ class CCS:
 
     def train(self, layer_name):
         """Train a single probe on the given hidden layer."""
-        x0 = (
+        x = (
             th.cat(
-                [pair[layer_name][0].unsqueeze(0) for pair in self.train_activations],
+                [pair[layer_name].unsqueeze(0) for pair in self.train_activations],
                 axis=0,
             )
             .detach()
             .to(self.device)
         )
-        x1 = (
-            th.cat(
-                [pair[layer_name][1].unsqueeze(0) for pair in self.train_activations],
-                axis=0,
-            )
-            .detach()
-            .to(self.device)
-        )
-        permutation = th.randperm(len(x0))
-        x0, x1 = x0[permutation], x1[permutation]
+        batch_size = len(x) if self.batch_size == -1 else self.batch_size
+        dataloader = DataLoader(x, batch_size, shuffle=True)
 
         # set up optimizer
         optimizer = th.optim.AdamW(
@@ -319,15 +312,11 @@ class CCS:
             weight_decay=self.weight_decay,
         )
 
-        batch_size = len(x0) if self.batch_size == -1 else self.batch_size
-        num_batches = len(x0) // batch_size
-
         # Start training (full batch)
         for epoch in trange(self.num_epochs):
-            for j in range(num_batches):
-                x0_batch = x0[j * batch_size : (j + 1) * batch_size]
-                x1_batch = x1[j * batch_size : (j + 1) * batch_size]
-
+            for batch in dataloader:
+                x0_batch = batch[:, 0]
+                x1_batch = batch[:, 1]
                 # probe
                 v0, v1 = self.probe(x0_batch), self.probe(x1_batch)
 
