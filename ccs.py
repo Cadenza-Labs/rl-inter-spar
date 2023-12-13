@@ -132,12 +132,13 @@ def get_hidden_activations_dataset(module, device, dataset):
 
 
 class ValueProbe(nn.Module):
-    def __init__(self, d):
+    def __init__(self, dim, layer_name):
         super().__init__()
-        self.linear1 = nn.Linear(d, 1)
+        self.linear = nn.Linear(dim, 1)
+        self.layer_name = layer_name
 
     def forward(self, x):
-        h = self.linear1(x)
+        h = self.linear(x)
         return th.tanh(h)
 
 
@@ -160,6 +161,7 @@ class CCS:
         val_fraction=0.2,
         seed=42,
     ):
+        # TODO: refactor so that CCS has a self.layer_name and only handle this layer
         self.env = env
         self.module = module
         # training
@@ -176,7 +178,7 @@ class CCS:
 
         if verbose:
             print("get hidden activations")
-        activations_path: Path = dataset_path.with_suffix('') / "activations.pt"
+        activations_path = dataset_path.with_suffix("") / "activations.pt"
         if activations_path.exists():
             if verbose:
                 print(f"Found cached activations at: {activations_path}")
@@ -198,8 +200,7 @@ class CCS:
 
     def initialize_probe(self, layer_name):
         dim = self.train_activations[0][layer_name].shape[-1]
-        self.probe = ValueProbe(dim)
-        self.probe.to(self.device)
+        return ValueProbe(dim, layer_name).to(self.device)
 
     def normalize(self, activations):
         """
@@ -265,9 +266,7 @@ class CCS:
                 [
                     th.flip(
                         th.cumsum(
-                            th.flip(
-                                -th.tensor(self.test_data[i].rews), dims=(0,)
-                            ),
+                            th.flip(-th.tensor(self.test_data[i].rews), dims=(0,)),
                             dim=0,
                         ),
                         dims=(0,),
@@ -292,11 +291,27 @@ class CCS:
             avg_return_sum.cpu().item(),
         )
 
-    def train(self, layer_name):
-        """Train a single probe on the given hidden layer."""
+    @th.no_grad()
+    def evaluate(self, probe, dataloader):
+        """
+        Evaluate a probe on a given dataset
+        """
+        train_loss = 0
+        for batch in dataloader:
+            x0_batch = batch[:, 0]
+            x1_batch = batch[:, 1]
+            v0, v1 = probe(x0_batch), probe(x1_batch)
+            train_loss += self.get_loss(v0, v1)
+        return train_loss
+
+    def train(self, probe):
+        """Train a single probe on its layer."""
         x = (
             th.cat(
-                [pair[layer_name].unsqueeze(0) for pair in self.train_activations],
+                [
+                    pair[probe.layer_name].unsqueeze(0)
+                    for pair in self.train_activations
+                ],
                 axis=0,
             )
             .detach()
@@ -307,7 +322,7 @@ class CCS:
 
         # set up optimizer
         optimizer = th.optim.AdamW(
-            self.probe.parameters(),
+            probe.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
@@ -318,7 +333,7 @@ class CCS:
                 x0_batch = batch[:, 0]
                 x1_batch = batch[:, 1]
                 # probe
-                v0, v1 = self.probe(x0_batch), self.probe(x1_batch)
+                v0, v1 = probe(x0_batch), probe(x1_batch)
 
                 # get the corresponding loss
                 loss = self.get_loss(v0, v1)
@@ -327,19 +342,18 @@ class CCS:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
-        return loss.detach().cpu().item()
+        return self.evaluate(probe, dataloader)
 
     def repeated_train(self, layer_name):
         """Repeatedly train probes on given hidden layer."""
         best_loss = np.inf
         for train_num in trange(self.num_tries):
-            self.initialize_probe(layer_name)
-            loss = self.train(layer_name)
-            print(f"Train repetition {train_num}, final train loss = {loss:.5f}")
+            probe = self.initialize_probe(layer_name)
+            loss = self.train(probe)
+            print(f"Train repetition {train_num}, final train loss = {float(loss):.5f}")
             if loss < best_loss:
                 print(f"New best loss!")
-                self.best_probe = copy.deepcopy(self.probe)
+                self.best_probe = copy.deepcopy(probe)
                 best_loss = loss
         return best_loss
 
@@ -412,7 +426,7 @@ if __name__ == "__main__":
 
         with open(data_save_path, "wb") as file:
             pickle.dump(trajs, file)
-    
+
     # Train multiple CCS probes on specified layer
     model = load_model(args.model_path, env, args.device)
     ccs = CCS(
