@@ -1,7 +1,7 @@
 import shutil
-import os
+import pathlib
+from pathlib import Path
 import pickle
-import torch
 import torch.nn as nn
 from torch.utils import data as data_th
 import torch as th
@@ -12,15 +12,15 @@ import random
 # from imitation.data.rollout import generate_trajectories, make_sample_until
 # from imitation.data.serialize import save, load_with_rewards
 import argparse
-from utils import Agent, preprocess, strtobool, get_env
-from os.path import join
+from agents.common import get_env, Agent, preprocess
+from utils import strtobool
 from huggingface_hub import hf_hub_download
-from tqdm import tqdm
+from tqdm import tqdm, trange
 from dataclasses import dataclass
 from nicehooks import nice_hooks
 
-HF_PATH = "hf_models"
-DATASET_PATH = "datasets"
+HF_PATH = Path("hf_models")
+DATASET_PATH = Path("datasets")
 
 
 @dataclass
@@ -46,7 +46,7 @@ class TrajectoriesCollector:
         }
         with tqdm(total=steps) as pbar:
             while True:
-                with torch.no_grad():
+                with th.no_grad():
                     action = policy(obs)
                 next_obs, reward, done, infos = self.env.step(action)
                 traj["obs"].append(obs)
@@ -77,8 +77,11 @@ class TrajectoriesCollector:
 def generate_dataset(env, model_path, num_episodes, max_episode_length, seed, device):
     """Generate trajectory data using the given environment and model."""
     model = load_model(model_path, env, device)
+    get_action = get_action_fn(model, device)
     trajectory_collector = TrajectoriesCollector(env)
-    trajectories = trajectory_collector.sample(model, num_episodes * max_episode_length)
+    trajectories = trajectory_collector.sample(
+        get_action, num_episodes * max_episode_length
+    )
     random.Random(seed).shuffle(trajectories)
     # trajectories = generate_trajectories(
     #    model,
@@ -89,47 +92,41 @@ def generate_dataset(env, model_path, num_episodes, max_episode_length, seed, de
     return trajectories
 
 
-def load_data(dataset_path, val_fraction, seed):
-    """Load and split data of given model."""
-    # dataset = load_with_rewards(join(DATASET_PATH, model_path))
-    # Load with pickle
+def load_data(dataset_path):
+    """Load trajectories"""
     with open(dataset_path, "rb") as file:
         dataset = pickle.load(file)
-    observations = sum([traj.obs for traj in dataset], [])
-    val_dataset, train_dataset = data_th.random_split(
-        observations,
-        lengths=[val_fraction, 1 - val_fraction],
-        generator=torch.Generator().manual_seed(seed),
-    )
-    return train_dataset, val_dataset
+    observation_pairs = sum([traj.obs for traj in dataset], [])
+    return observation_pairs
 
 
 def load_model(model_path, env, device):
-    """
-    Load the model and return a function that evaluate the model on a given numpy observation.
-    """
     agent = Agent(env)
     agent.load(model_path)
     agent.to(device)
+    return agent
+
+
+def get_action_fn(agent, device):
+    """
+    Load the model and return a function that evaluate the model on a given numpy observation.
+    """
 
     def model(obs: np.ndarray):
-        obs = torch.tensor(obs, dtype=torch.float).to(device)
+        obs = th.tensor(obs, dtype=th.float).to(device)
         return agent.get_action(obs).detach().cpu().numpy()
 
     return model
 
 
 def get_hidden_activations_dataset(module, device, dataset):
-    """Calculate hidden layer activations for given trajectory dataset."""
+    """Calculate hidden layer activations for given pair dataset."""
     hidden_act_dataset = []
-    for traj in dataset:
-        obs_1, obs_2 = traj.obs
-        th_obs_1 = preprocess(th.tensor(obs_1, dtype=th.float).to(device))
-        th_obs_2 = preprocess(th.tensor(obs_2, dtype=th.float).to(device))
+    for pair in tqdm(dataset):
+        th_pair = preprocess(th.tensor(pair, dtype=th.float).to(device))
         with th.no_grad():
-            _, activations_1 = nice_hooks.run(module, th_obs_1)
-            _, activations_2 = nice_hooks.run(module, th_obs_2)
-            hidden_act_dataset.append((activations_1.cpu(), activations_2.cpu()))
+            _, activations = nice_hooks.run(module, th_pair, return_activations=True)
+            hidden_act_dataset.append(activations.to("cpu"))
     return hidden_act_dataset
 
 
@@ -140,7 +137,7 @@ class ValueProbe(nn.Module):
 
     def forward(self, x):
         h = self.linear1(x)
-        return torch.tanh(h)
+        return th.tanh(h)
 
 
 class CCS:
@@ -176,17 +173,30 @@ class CCS:
         self.val_fraction = val_fraction
         self.seed = seed
 
-        self.train_data, self.test_data = load_data(dataset_path, val_fraction, seed)
-
-        self.train_activations = get_hidden_activations_dataset(
-            module, device, self.train_data
-        )
-        self.test_activations = get_hidden_activations_dataset(
-            module, device, self.test_data
+        if verbose:
+            print("get hidden activations")
+        activations_path: Path = dataset_path.with_suffix('') / "activations.pt"
+        if activations_path.exists():
+            if verbose:
+                print(f"Found cached activations at: {activations_path}")
+            activation_pairs = th.load(activations_path)
+        else:
+            if verbose:
+                print(f"No cached activations. Computing them...")
+            observation_pairs = load_data(dataset_path)
+            activation_pairs = get_hidden_activations_dataset(
+                module, device, observation_pairs
+            )
+            activations_path.parent.mkdir(parents=True, exist_ok=True)
+            th.save(activation_pairs, activations_path)
+        self.train_activations, self.test_activations = data_th.random_split(
+            activation_pairs,
+            lengths=[val_fraction, 1 - val_fraction],
+            generator=th.Generator().manual_seed(seed),
         )
 
     def initialize_probe(self, layer_name):
-        dim = self.train_activations[0][0][layer_name].shape[-1]
+        dim = self.train_activations[0][layer_name].shape[-1]
         self.probe = ValueProbe(dim)
         self.probe.to(self.device)
 
@@ -215,7 +225,7 @@ class CCS:
             len(self.test_activations[i][0][layer_name]) for i in range(num_trajs)
         ]
         x0 = (
-            torch.cat(
+            th.cat(
                 [self.test_activations[i][0][layer_name] for i in range(num_trajs)],
                 axis=0,
             )
@@ -223,7 +233,7 @@ class CCS:
             .to(self.device)
         )
         x1 = (
-            torch.cat(
+            th.cat(
                 [self.test_activations[i][1][layer_name] for i in range(num_trajs)],
                 axis=0,
             )
@@ -232,11 +242,11 @@ class CCS:
         )
         # compute returns from trajectory data assuming gamma=1
         return_1 = (
-            torch.cat(
+            th.cat(
                 [
-                    torch.flip(
-                        torch.cumsum(
-                            torch.flip(torch.tensor(self.test_data[i].rews), dims=(0,)),
+                    th.flip(
+                        th.cumsum(
+                            th.flip(th.tensor(self.test_data[i].rews), dims=(0,)),
                             dim=0,
                         ),
                         dims=(0,),
@@ -250,12 +260,12 @@ class CCS:
         )
         # TODO here we make the assumption that player 2 reward is the negative of player 1
         return_2 = (
-            torch.cat(
+            th.cat(
                 [
-                    torch.flip(
-                        torch.cumsum(
-                            torch.flip(
-                                -torch.tensor(self.test_data[i].rews), dims=(0,)
+                    th.flip(
+                        th.cumsum(
+                            th.flip(
+                                -th.tensor(self.test_data[i].rews), dims=(0,)
                             ),
                             dim=0,
                         ),
@@ -268,7 +278,7 @@ class CCS:
             .detach()
             .to(self.device)
         )
-        with torch.no_grad():
+        with th.no_grad():
             value_1, value_2 = self.best_probe(x0), self.best_probe(x1)
         avg_value_sum = (value_1 + value_2).mean()
         avg_return_sum = (return_1 + return_2).mean()
@@ -283,28 +293,27 @@ class CCS:
 
     def train(self, layer_name):
         """Train a single probe on the given hidden layer."""
-        num_trajs = len(self.train_activations)
         x0 = (
-            torch.cat(
-                [self.train_activations[i][0][layer_name] for i in range(num_trajs)],
+            th.cat(
+                [pair[layer_name][0].unsqueeze(0) for pair in self.train_activations],
                 axis=0,
             )
             .detach()
             .to(self.device)
         )
         x1 = (
-            torch.cat(
-                [self.train_activations[i][1][layer_name] for i in range(num_trajs)],
+            th.cat(
+                [pair[layer_name][1].unsqueeze(0) for pair in self.train_activations],
                 axis=0,
             )
             .detach()
             .to(self.device)
         )
-        permutation = torch.randperm(len(x0))
+        permutation = th.randperm(len(x0))
         x0, x1 = x0[permutation], x1[permutation]
 
         # set up optimizer
-        optimizer = torch.optim.AdamW(
+        optimizer = th.optim.AdamW(
             self.probe.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
@@ -314,7 +323,7 @@ class CCS:
         num_batches = len(x0) // batch_size
 
         # Start training (full batch)
-        for epoch in range(self.num_epochs):
+        for epoch in trange(self.num_epochs):
             for j in range(num_batches):
                 x0_batch = x0[j * batch_size : (j + 1) * batch_size]
                 x1_batch = x1[j * batch_size : (j + 1) * batch_size]
@@ -335,7 +344,7 @@ class CCS:
     def repeated_train(self, layer_name):
         """Repeatedly train probes on given hidden layer."""
         best_loss = np.inf
-        for train_num in range(self.num_tries):
+        for train_num in trange(self.num_tries):
             self.initialize_probe(layer_name)
             loss = self.train(layer_name)
             print(f"Train repetition {train_num}, final train loss = {loss:.5f}")
@@ -361,7 +370,6 @@ if __name__ == "__main__":
         help="Device to use. [cuda, cpu]",
         default="cuda",
     )
-
     parser.add_argument(
         "--from_hf",
         type=lambda x: bool(strtobool(x)),
@@ -369,6 +377,17 @@ if __name__ == "__main__":
         nargs="?",
         const=True,
         default=True,
+    )
+    parser.add_argument(
+        "--capture-video",
+        type=lambda x: bool(strtobool(x)),
+        help="Whether to capture videos from the data collection",
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    parser.add_argument(
+        "--layer_name", type=str, help="The layer to run ccs on", default=""
     )
     args = parser.parse_args()
     # TODO? support multiple envs
@@ -378,7 +397,6 @@ if __name__ == "__main__":
     # env.reset = lambda : f()[0]
     # print(f"type: {env.reset()[0].shape}")
     # exit()
-    layer_name = "cnn"
     args.model_name = args.model_path
     if args.from_hf:
         hf_hub_download(
@@ -386,11 +404,10 @@ if __name__ == "__main__":
             filename=args.model_path,
             local_dir="hf_models",
         )
-        args.model_path = join(HF_PATH, args.model_path)
-        
+        args.model_path = HF_PATH / args.model_path
 
-    data_save_path = join(DATASET_PATH, args.model_name, "selfplay.pkl")
-    if not os.path.exists(data_save_path):
+    data_save_path = DATASET_PATH / args.model_name / "selfplay.pkl"
+    if not data_save_path.exists():
         print("Generating dataset...")
         trajs = generate_dataset(
             env,
@@ -402,17 +419,21 @@ if __name__ == "__main__":
             device=args.device,
         )
         # save(data_save_path, trajs)
-        os.makedirs(os.path.dirname(data_save_path), exist_ok=True)
+        data_save_path.parent.mkdir(parents=True, exist_ok=True)
+
         with open(data_save_path, "wb") as file:
             pickle.dump(trajs, file)
-
+    
     # Train multiple CCS probes on specified layer
-    ccs = CCS(env, args.model_path, data_save_path, device=args.device)
-    ccs.repeated_train(layer_name)
+    model = load_model(args.model_path, env, args.device)
+    ccs = CCS(
+        env, model.critic_network, data_save_path, device=args.device, verbose=True
+    )
+    ccs.repeated_train(args.layer_name)
 
     # Evaluate probe against trajectory returns
-    print(
-        "Best probe CCS eval metrics: v1_loss={:.5f}, v2_loss={:.5f}, avg_value_sum={:.5f}, avg_return_sum={:.5f}".format(
-            *ccs.get_return_metrics()
-        )
-    )
+    # print(
+    #     "Best probe CCS eval metrics: v1_loss={:.5f}, v2_loss={:.5f}, avg_value_sum={:.5f}, avg_return_sum={:.5f}".format(
+    #         *ccs.get_return_metrics()
+    #     )
+    # )
