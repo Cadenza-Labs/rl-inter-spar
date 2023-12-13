@@ -1,7 +1,7 @@
 import importlib
 
 import numpy as np
-import torch
+import torch as th
 from torch import nn
 import supersuit as ss
 import gymnasium as gym
@@ -10,8 +10,8 @@ from torch.distributions import Categorical
 import warnings
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
+    th.nn.init.orthogonal_(layer.weight, std)
+    th.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 
@@ -128,6 +128,14 @@ class Agent(nn.Module):
         )
 
     def load(self, path):
-        self.load_state_dict(torch.load(path))
+        self.load_state_dict(th.load(path))
         if self.share_network:
             self.critic_network = self.actor_network
+
+    def forward(self, x):
+        """
+        Dummy function to collect both actor and critic activations
+        """
+        _ = self.actor(self.actor_network(x))
+        _ = self.critic(self.critic_network(x))
+        return th.tensor(0).to(x.device)  # Dummy return
