@@ -9,6 +9,7 @@ import torch as th
 import copy
 import numpy as np
 import random
+from itertools import product
 
 # from imitation.data.rollout import generate_trajectories, make_sample_until
 # from imitation.data.serialize import save, load_with_rewards
@@ -132,10 +133,9 @@ def get_hidden_activations_dataset(module, device, dataset):
 
 
 class ValueProbe(nn.Module):
-    def __init__(self, dim, layer_name):
+    def __init__(self, dim):
         super().__init__()
         self.linear = nn.Linear(dim, 1)
-        self.layer_name = layer_name
 
     def forward(self, x):
         h = self.linear(x)
@@ -149,6 +149,7 @@ class CCS:
         self,
         env,
         module,
+        layer_name,
         dataset_path,
         num_epochs=1000,
         num_tries=10,
@@ -164,6 +165,7 @@ class CCS:
         # TODO: refactor so that CCS has a self.layer_name and only handle this layer
         self.env = env
         self.module = module
+        self.layer_name = layer_name
         # training
         self.var_normalize = var_normalize
         self.num_epochs = num_epochs
@@ -178,6 +180,8 @@ class CCS:
 
         if verbose:
             print("get hidden activations")
+        # TODO: load outside to avoid dupicate
+        # TODO: we could store the activations of each layer in different files
         activations_path = dataset_path.with_suffix("") / "activations.pt"
         if activations_path.exists():
             if verbose:
@@ -192,15 +196,23 @@ class CCS:
             )
             activations_path.parent.mkdir(parents=True, exist_ok=True)
             th.save(activation_pairs, activations_path)
+        activation_pairs = (
+            th.cat(
+                [pair[layer_name].unsqueeze(0) for pair in activation_pairs],
+                axis=0,
+            )
+            .detach()
+            .to(self.device)
+        )
         self.train_activations, self.test_activations = data_th.random_split(
             activation_pairs,
             lengths=[val_fraction, 1 - val_fraction],
             generator=th.Generator().manual_seed(seed),
         )
 
-    def initialize_probe(self, layer_name):
-        dim = self.train_activations[0][layer_name].shape[-1]
-        return ValueProbe(dim, layer_name).to(self.device)
+    def initialize_probe(self):
+        dim = self.train_activations[0].shape[-1]
+        return ValueProbe(dim).to(self.device)
 
     def normalize(self, activations):
         """
@@ -220,7 +232,8 @@ class CCS:
         consistent_loss = ((value_1 + value_2) ** 2).mean(0)
         return consistent_loss + informative_loss
 
-    def get_return_metrics(self):
+    def get_return_metrics(self, probe):
+        raise NotImplementedError("TODO: Return metric needs to be adapted")
         """Computes metrics of value probe against trajectory returns."""
         num_trajs = len(self.test_activations)
         traj_lengths = [
@@ -306,19 +319,10 @@ class CCS:
 
     def train(self, probe):
         """Train a single probe on its layer."""
-        x = (
-            th.cat(
-                [
-                    pair[probe.layer_name].unsqueeze(0)
-                    for pair in self.train_activations
-                ],
-                axis=0,
-            )
-            .detach()
-            .to(self.device)
+        batch_size = (
+            len(self.train_activations) if self.batch_size == -1 else self.batch_size
         )
-        batch_size = len(x) if self.batch_size == -1 else self.batch_size
-        dataloader = DataLoader(x, batch_size, shuffle=True)
+        dataloader = DataLoader(self.train_activations, batch_size, shuffle=True)
 
         # set up optimizer
         optimizer = th.optim.AdamW(
@@ -344,17 +348,22 @@ class CCS:
                 optimizer.step()
         return self.evaluate(probe, dataloader)
 
-    def repeated_train(self, layer_name):
+    def repeated_train(self):
         """Repeatedly train probes on given hidden layer."""
         best_loss = np.inf
+        batch_size = (
+            len(self.test_activations) if self.batch_size == -1 else self.batch_size
+        )
+        test_set = DataLoader(self.test_activations, batch_size)
         for train_num in trange(self.num_tries):
-            probe = self.initialize_probe(layer_name)
-            loss = self.train(probe)
-            print(f"Train repetition {train_num}, final train loss = {float(loss):.5f}")
-            if loss < best_loss:
+            probe = self.initialize_probe()
+            train_loss = self.train(probe)
+            test_loss = self.evaluate(probe, test_set)
+            print(f"Train repetition {train_num}, final train loss = {float(train_loss):.5f}, test loss {float(test_loss)}")
+            if train_loss < best_loss:
                 print(f"New best loss!")
                 self.best_probe = copy.deepcopy(probe)
-                best_loss = loss
+                best_loss = train_loss
         return best_loss
 
 
@@ -390,7 +399,17 @@ if __name__ == "__main__":
         default=False,
     )
     parser.add_argument(
-        "--layer_name", type=str, help="The layer to run ccs on", default=""
+        "--modules",
+        help="The modules of the model to run ccs on (critic_network | actor_network)",
+        nargs="*",
+        default=[],
+    )
+    parser.add_argument(
+        "--layer_indicies",
+        help="The indicies of the module layer we want to run ccs on",
+        type=int,
+        nargs="*",
+        default=[],
     )
     args = parser.parse_args()
     # TODO? support multiple envs
@@ -427,12 +446,28 @@ if __name__ == "__main__":
         with open(data_save_path, "wb") as file:
             pickle.dump(trajs, file)
 
-    # Train multiple CCS probes on specified layer
     model = load_model(args.model_path, env, args.device)
-    ccs = CCS(
-        env, model.critic_network, data_save_path, device=args.device, verbose=True
-    )
-    ccs.repeated_train(args.layer_name)
+    
+    # Train multiple CCS probes on specified layer
+    if args.layer_indicies == []:
+        args.layer_indicies = range(len(model.actor_network)) # actor and critic network have same number of layers
+    if args.modules == []:
+        args.modules = ["actor_network", "critic_network"]
+    layers = product(args.modules, args.layer_indicies)
+    probes = []
+    for module, layer in layers:
+        layer_name = f"{module}.{layer}"
+        print(f"\n\n====== Training CCS probe for {layer_name} ======")
+        ccs = CCS(
+            env,
+            model,
+            layer_name,
+            data_save_path,
+            device=args.device,
+            # verbose=True,
+        )
+        ccs.repeated_train()
+        probes.append(ccs)
 
     # Evaluate probe against trajectory returns
     # print(
