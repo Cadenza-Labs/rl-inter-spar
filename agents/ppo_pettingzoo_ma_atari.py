@@ -1,10 +1,12 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_pettingzoo_ma_ataripy
 import argparse
 import os
+from pathlib import Path
 import random
 import time
 from distutils.util import strtobool
 
+from huggingface_hub import hf_hub_download
 import numpy as np
 import torch
 import torch.nn as nn
@@ -45,6 +47,10 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="pong_v3",
         help="the id of the environment")
+    parser.add_argument("--opponent-paths", type=str, default=["self"], nargs="+",
+        help="the path to the agent's opponents")
+    parser.add_argument("--n-opponent-episode", type=int, default=10,
+        help="the number of episodes to play against an opponent before changing to another one")
     parser.add_argument("--total-timesteps", type=int, default=30_000_000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=2.5e-4,
@@ -115,14 +121,33 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-
+    hf_path = Path(__file__).resolve().parent.parent / "hf_models"
     # env setup
     envs = get_env(args, run_name)
     agent = Agent(envs, args.share_network).to(device)
     if args.load_model != "":
-        agent.load(args.load_model)
+        hf_hub_download(
+            repo_id="Butanium/selfplay_ppo_pong_v3_pettingzoo_cleanRL",
+            filename=args.load_model,
+            local_dir=hf_path,
+        )
+        agent.load(hf_path / args.load_model)
+    opponents = []
+    for opponent_path in args.opponent_paths:
+        if opponent_path == "self":
+            opponents.append(agent)
+        else:
+            print(f"Loading opponent from {opponent_path}")
+            hf_hub_download(
+                repo_id="Butanium/selfplay_ppo_pong_v3_pettingzoo_cleanRL",
+                filename=opponent_path,
+                local_dir=hf_path
+            )
+            opponent = Agent(envs, args.share_network).to(device)
+            opponent.load(hf_path / opponent_path)
+            opponent.requires_grad_(False)
+            opponents.append(opponent)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
-
     # ALGO Logic: Storage setup
     obs = torch.zeros(
         (args.num_steps, args.num_envs) + envs.single_observation_space.shape
@@ -146,6 +171,9 @@ if __name__ == "__main__":
         if args.num_checkpoints > 0
         else num_updates + 2
     )
+    # Sample from opponents
+    opponent = random.choice(opponents)
+    next_opponent_change = args.n_opponent_episode
     for update in range(1, num_updates + 1):
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -157,16 +185,21 @@ if __name__ == "__main__":
             global_step += 1 * args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
-
+            next_opponent_change -= next_done.sum().item()
+            if next_opponent_change <= 0:
+                opponent = random.choice(opponents)
+                next_opponent_change = args.n_opponent_episode
             # ALGO LOGIC: action logic
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
+                real_actions = action.cpu().numpy()
+                real_actions[1::2] = opponent.get_action(next_obs[1::2]).cpu()
             actions[step] = action
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, done, info = envs.step(action.cpu().numpy())
+            next_obs, reward, done, info = envs.step(real_actions)
             # Change done to be when reward is != 0
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(
