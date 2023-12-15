@@ -59,7 +59,7 @@ class TrajectoriesCollector:
                 obs = next_obs
                 if i % (steps // 10) == 0:
                     pbar.update(i)
-                if done.any():  # TODO: change this for multi envs
+                if done.any():
                     i_episode = 0
                     traj["terminal"] = True
                     trajs.append(Trajectory(**traj))
@@ -99,7 +99,9 @@ def load_data(dataset_path):
     with open(dataset_path, "rb") as file:
         dataset = pickle.load(file)
     observation_pairs = sum([traj.obs for traj in dataset], [])
-    return observation_pairs
+    reward_pairs = sum([traj.rewards for traj in dataset], [])
+    return_pairs = th.cat([calculate_returns(traj.rewards) for traj in dataset], dim=0)
+    return observation_pairs, return_pairs
 
 
 def load_model(model_path, env, device):
@@ -140,6 +142,16 @@ class ValueProbe(nn.Module):
     def forward(self, x):
         h = self.linear(x)
         return th.tanh(h)
+
+
+def calculate_returns(reward_pairs, gamma=0.99):
+    reward_pairs = th.tensor(reward_pairs)
+    discounts = gamma**th.arange(len(reward_pairs))
+    print(discounts.shape)
+    return_pairs = th.flip(
+        th.cumsum(th.flip(discounts[:, None] * reward_pairs, dims=(0,)), dim=0), dims=(0,)
+    )
+    return return_pairs
 
 
 class CCS:
@@ -183,19 +195,23 @@ class CCS:
         # TODO: load outside to avoid dupicate
         # TODO: we could store the activations of each layer in different files
         activations_path = dataset_path.with_suffix("") / "activations.pt"
-        if activations_path.exists():
+        returns_path = dataset_path.with_suffix("") / "returns.pt"
+        if activations_path.exists() and False:
             if verbose:
                 print(f"Found cached activations at: {activations_path}")
             activation_pairs = th.load(activations_path)
+            return_pairs = th.load(returns_path)
+            print("loaded return pairs", return_pairs.shape)
         else:
             if verbose:
                 print(f"No cached activations. Computing them...")
-            observation_pairs = load_data(dataset_path)
+            observation_pairs, return_pairs = load_data(dataset_path)
             activation_pairs = get_hidden_activations_dataset(
                 module, device, observation_pairs
             )
             activations_path.parent.mkdir(parents=True, exist_ok=True)
             th.save(activation_pairs, activations_path)
+            th.save(return_pairs, returns_path)
         activation_pairs = (
             th.cat(
                 [pair[layer_name].unsqueeze(0) for pair in activation_pairs],
@@ -204,6 +220,8 @@ class CCS:
             .detach()
             .to(self.device)
         )
+        # TODO split returns with the same permutation and save as attribute for use
+        # in eval function
         self.train_activations, self.test_activations = data_th.random_split(
             activation_pairs,
             lengths=[val_fraction, 1 - val_fraction],
@@ -359,7 +377,9 @@ class CCS:
             probe = self.initialize_probe()
             train_loss = self.train(probe)
             test_loss = self.evaluate(probe, test_set)
-            print(f"Train repetition {train_num}, final train loss = {float(train_loss):.5f}, test loss {float(test_loss)}")
+            print(
+                f"Train repetition {train_num}, final train loss = {float(train_loss):.5f}, test loss {float(test_loss)}"
+            )
             if train_loss < best_loss:
                 print(f"New best loss!")
                 self.best_probe = copy.deepcopy(probe)
@@ -447,10 +467,12 @@ if __name__ == "__main__":
             pickle.dump(trajs, file)
 
     model = load_model(args.model_path, env, args.device)
-    
+
     # Train multiple CCS probes on specified layer
     if args.layer_indicies == []:
-        args.layer_indicies = range(len(model.actor_network)) # actor and critic network have same number of layers
+        args.layer_indicies = range(
+            len(model.actor_network)
+        )  # actor and critic network have same number of layers
     if args.modules == []:
         args.modules = ["actor_network", "critic_network"]
     layers = product(args.modules, args.layer_indicies)
