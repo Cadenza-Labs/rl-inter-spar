@@ -1,5 +1,3 @@
-import shutil
-import pathlib
 from pathlib import Path
 import pickle
 import torch.nn as nn
@@ -8,6 +6,7 @@ from torch.utils.data import DataLoader
 import torch as th
 import copy
 import numpy as np
+import scipy
 import random
 from itertools import product
 
@@ -106,7 +105,7 @@ def load_data(dataset_path):
 
 def load_model(model_path, env, device):
     agent = Agent(env)
-    agent.load(model_path)
+    agent.load(model_path, device)
     agent.to(device)
     return agent
 
@@ -143,15 +142,28 @@ class ValueProbe(nn.Module):
         h = self.linear(x)
         return th.tanh(h)
 
+def discount_cumsum(x, discount):
+    """
+    magic from rllab for computing discounted cumulative sums of vectors.
+
+    input: 
+        vector x, 
+        [x0, 
+         x1, 
+         x2]
+
+    output:
+        [x0 + discount * x1 + discount^2 * x2,  
+         x1 + discount * x2,
+         x2]
+    """
+    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
 
 def calculate_returns(reward_pairs, gamma=0.99):
-    reward_pairs = th.tensor(reward_pairs)
-    discounts = gamma**th.arange(len(reward_pairs))
-    print(discounts.shape)
-    return_pairs = th.flip(
-        th.cumsum(th.flip(discounts[:, None] * reward_pairs, dims=(0,)), dim=0), dims=(0,)
-    )
-    return return_pairs
+    """Calculate discounted returns for each step in given pair of reward histories."""
+    reward_pairs = np.array(reward_pairs)
+    return_pairs = np.stack((discount_cumsum(reward_pairs[:, 0], gamma), discount_cumsum(reward_pairs[:, 1], gamma))).T
+    return th.tensor(return_pairs)
 
 
 class CCS:

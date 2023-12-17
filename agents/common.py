@@ -127,8 +127,8 @@ class Agent(nn.Module):
             self.critic(self.critic_network(x)),
         )
 
-    def load(self, path):
-        self.load_state_dict(th.load(path))
+    def load(self, path, device):
+        self.load_state_dict(th.load(path, map_location=th.device(device)))
         if self.share_network:
             self.critic_network = self.actor_network
 
