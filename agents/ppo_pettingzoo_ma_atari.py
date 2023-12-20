@@ -86,7 +86,13 @@ def parse_args():
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
     args = parser.parse_args()
-    args.batch_size = int(args.num_envs * args.num_steps)
+    is_multiagent = args.opponent_paths != ["self"]
+    if is_multiagent:
+        args.num_training_envs = args.num_envs // 2
+    else:
+        args.num_training_envs = args.num_envs
+    args.is_multiagent = is_multiagent
+    args.batch_size = int(args.num_training_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     # fmt: on
     return args
@@ -125,6 +131,7 @@ if __name__ == "__main__":
     # env setup
     envs = get_env(args, run_name)
     agent = Agent(envs, args.share_network).to(device)
+    agent.name = "self"
     if args.load_model != "":
         hf_hub_download(
             repo_id="Butanium/selfplay_ppo_pong_v3_pettingzoo_cleanRL",
@@ -141,30 +148,30 @@ if __name__ == "__main__":
             hf_hub_download(
                 repo_id="Butanium/selfplay_ppo_pong_v3_pettingzoo_cleanRL",
                 filename=opponent_path,
-                local_dir=hf_path
+                local_dir=hf_path,
             )
             opponent = Agent(envs, args.share_network).to(device)
             opponent.load(hf_path / opponent_path)
             opponent.requires_grad_(False)
+            opponent.name = opponent_path
             opponents.append(opponent)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     # ALGO Logic: Storage setup
     obs = torch.zeros(
-        (args.num_steps, args.num_envs) + envs.single_observation_space.shape
+        (args.num_steps, args.num_training_envs) + envs.single_observation_space.shape
     ).to(device)
     actions = torch.zeros(
-        (args.num_steps, args.num_envs) + envs.single_action_space.shape
+        (args.num_steps, args.num_training_envs) + envs.single_action_space.shape
     ).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
-
+    logprobs = torch.zeros((args.num_steps, args.num_training_envs)).to(device)
+    rewards = torch.zeros((args.num_steps, args.num_training_envs)).to(device)
+    dones = torch.zeros((args.num_steps, args.num_training_envs)).to(device)
+    values = torch.zeros((args.num_steps, args.num_training_envs)).to(device)
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
+    next_done = torch.zeros(args.num_training_envs).to(device)
     next_obs = torch.Tensor(envs.reset()).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
     checkpoint_delta = (
         num_updates // args.num_checkpoints
@@ -182,29 +189,42 @@ if __name__ == "__main__":
             optimizer.param_groups[0]["lr"] = lrnow
 
         for step in range(0, args.num_steps):
-            global_step += 1 * args.num_envs
-            obs[step] = next_obs
+            global_step += args.num_training_envs
+            obs[step] = next_obs[::2] if args.is_multiagent else next_obs
             dones[step] = next_done
             next_opponent_change -= next_done.sum().item()
             if next_opponent_change <= 0:
                 opponent = random.choice(opponents)
+                print(f"Changing opponent to {opponent.name}")
                 next_opponent_change = args.n_opponent_episode
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
-                real_actions = action.cpu().numpy()
-                real_actions[1::2] = opponent.get_action(next_obs[1::2]).cpu()
+                if args.is_multiagent:
+                    action, logprob, _, value = agent.get_action_and_value(
+                        next_obs[::2]
+                    )
+                    opponent_action = opponent.get_action(next_obs[1::2])
+                    real_actions = (
+                        torch.stack([action, opponent_action], dim=1)
+                        .view(-1, *action.shape[1:])
+                        .cpu()
+                        .numpy()
+                    )
+                else:
+                    action, logprob, _, value = agent.get_action_and_value(next_obs)
+                    real_actions = action.cpu().numpy()
+            values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, done, info = envs.step(real_actions)
             # Change done to be when reward is != 0
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(
-                done
-            ).to(device)
+            reward = torch.Tensor(reward).to(device).view(-1)
+            rewards[step] = reward[::2] if args.is_multiagent else reward
+            next_done = torch.Tensor(done).to(device)
+            next_done = next_done[::2] if args.is_multiagent else next_done
+            next_obs = torch.Tensor(next_obs).to(device)
             next_done = torch.logical_or(next_done, rewards[step] != 0).float()
 
             for idx, item in enumerate(info):
@@ -226,7 +246,9 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(
+                next_obs[::2] if args.is_multiagent else next_obs
+            ).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
