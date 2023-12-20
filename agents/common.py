@@ -112,7 +112,7 @@ class Agent(nn.Module):
             probs = Categorical(logits=logits)
             return probs.sample()
         else:
-            return probs.argmax(dim=1)
+            return logits.argmax(dim=1)
 
     def get_action_and_value(self, x, action=None):
         x = preprocess(x)
