@@ -112,8 +112,10 @@ def tournament(envs, agents, total_rounds, device, video_path=None):
             f"{player1.name} vs {player2.name}: {wins} wins / {draws} draws / {num_rounds - wins - draws} losses"
         )
         print(f"Average episode length: {total_length / num_rounds}")
-        print(f"SPS: {total_length + current_lengths.sum() / (time.time() - start_time)}")
-        
+        print(
+            f"SPS: {total_length + current_lengths.sum() / (time.time() - start_time)}"
+        )
+
     return winrates, lengths
 
 
@@ -191,7 +193,9 @@ if __name__ == "__main__":
     ax.set_yticks(np.arange(len(agents)), labels=[agents[i].name for i in indicies])
     for i in range(len(agents)):
         for j in range(len(agents)):
-            ax.text(j, i, f"{winrates[i,j]:.2f}", ha="center", va="center", color="black")
+            ax.text(
+                j, i, f"{winrates[i,j]:.2f}", ha="center", va="center", color="black"
+            )
     ax.set_title("Winrates")
     fig.tight_layout()
 
@@ -216,13 +220,18 @@ if __name__ == "__main__":
     for i in range(len(agents)):
         for j in range(len(agents)):
             ax.text(
-                j, i, f"{mean_lengths[i,j]:.2f}", ha="center", va="center", color="black"
+                j,
+                i,
+                f"{mean_lengths[i,j]:.2f}",
+                ha="center",
+                va="center",
+                color="black",
             )
     ax.set_title("Mean episode lengths")
     fig.tight_layout()
 
     writer.add_figure("Mean episode lengths", fig)
-    
+
     if args.track:
         wandb.log({"Mean episode lengths": wandb.Image(fig)})
     fig.savefig(f"runs/{run_name}/mean_lengths.png")
