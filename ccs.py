@@ -13,7 +13,7 @@ from itertools import product
 # from imitation.data.rollout import generate_trajectories, make_sample_until
 # from imitation.data.serialize import save, load_with_rewards
 import argparse
-from agents.common import get_env, Agent, preprocess
+from agents.common import get_env, Agent, preprocess, playground
 from utils import strtobool
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm, trange
@@ -52,13 +52,13 @@ class TrajectoriesCollector:
                 next_obs, reward, done, infos = self.env.step(action)
                 traj["obs"].append(obs)
                 traj["actions"].append(action)
-                traj["rewards"].append(np.array(reward))
+                traj["rewards"].append(reward)
                 i += 1
                 i_episode += 1
                 obs = next_obs
                 if i % (steps // 10) == 0:
                     pbar.update(i)
-                if done.any():
+                if done.any() or (reward != 0).any():
                     i_episode = 0
                     traj["terminal"] = True
                     trajs.append(Trajectory(**traj))
@@ -68,7 +68,6 @@ class TrajectoriesCollector:
                         "rewards": [],
                         "terminal": False,
                     }
-                    obs = self.env.reset()
                     if i > steps:
                         break
         print(f"Generated {len(trajs)} trajectories.")
@@ -139,30 +138,37 @@ class ValueProbe(nn.Module):
         self.linear = nn.Linear(dim, 1)
 
     def forward(self, x):
-        h = self.linear(x)
+        h = self.linear(x.flatten(start_dim=1))
         return th.tanh(h)
+
 
 def discount_cumsum(x, discount):
     """
     magic from rllab for computing discounted cumulative sums of vectors.
 
-    input: 
-        vector x, 
-        [x0, 
-         x1, 
+    input:
+        vector x,
+        [x0,
+         x1,
          x2]
 
     output:
-        [x0 + discount * x1 + discount^2 * x2,  
+        [x0 + discount * x1 + discount^2 * x2,
          x1 + discount * x2,
          x2]
     """
     return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
 
+
 def calculate_returns(reward_pairs, gamma=0.99):
     """Calculate discounted returns for each step in given pair of reward histories."""
     reward_pairs = np.array(reward_pairs)
-    return_pairs = np.stack((discount_cumsum(reward_pairs[:, 0], gamma), discount_cumsum(reward_pairs[:, 1], gamma))).T
+    return_pairs = np.stack(
+        (
+            discount_cumsum(reward_pairs[:, 0], gamma),
+            discount_cumsum(reward_pairs[:, 1], gamma),
+        )
+    ).T
     return th.tensor(return_pairs)
 
 
@@ -172,7 +178,7 @@ class CCS:
     def __init__(
         self,
         env,
-        module,
+        model,
         layer_name,
         dataset_path,
         num_epochs=1000,
@@ -188,7 +194,7 @@ class CCS:
     ):
         # TODO: refactor so that CCS has a self.layer_name and only handle this layer
         self.env = env
-        self.module = module
+        self.model = model
         self.layer_name = layer_name
         # training
         self.var_normalize = var_normalize
@@ -208,7 +214,7 @@ class CCS:
         # TODO: we could store the activations of each layer in different files
         activations_path = dataset_path.with_suffix("") / "activations.pt"
         returns_path = dataset_path.with_suffix("") / "returns.pt"
-        if activations_path.exists() and False:
+        if activations_path.exists():
             if verbose:
                 print(f"Found cached activations at: {activations_path}")
             activation_pairs = th.load(activations_path)
@@ -219,7 +225,7 @@ class CCS:
                 print(f"No cached activations. Computing them...")
             observation_pairs, return_pairs = load_data(dataset_path)
             activation_pairs = get_hidden_activations_dataset(
-                module, device, observation_pairs
+                model, device, observation_pairs
             )
             activations_path.parent.mkdir(parents=True, exist_ok=True)
             th.save(activation_pairs, activations_path)
@@ -241,7 +247,7 @@ class CCS:
         )
 
     def initialize_probe(self):
-        dim = self.train_activations[0].shape[-1]
+        dim = self.train_activations[0][0].flatten().shape[0]
         return ValueProbe(dim).to(self.device)
 
     def normalize(self, activations):
@@ -347,6 +353,15 @@ class CCS:
             train_loss += self.get_loss(v0, v1)
         return train_loss
 
+    @th.no_grad()
+    def elicit(self, obs):
+        """
+        Elicit a value from the model using `self.best_probe` for a given observation
+        """
+        obs = preprocess(obs)
+        _, activations = nice_hooks.run(self.model, obs, return_activations=True)
+        return self.best_probe(activations[self.layer_name])
+
     def train(self, probe):
         """Train a single probe on its layer."""
         batch_size = (
@@ -443,6 +458,12 @@ if __name__ == "__main__":
         nargs="*",
         default=[],
     )
+    parser.add_argument(
+        "--rounds_to_record",
+        help="The number of rounds to record",
+        type=int,
+        default=30,
+    )
     args = parser.parse_args()
     # TODO? support multiple envs
     args.num_envs = 2
@@ -487,8 +508,9 @@ if __name__ == "__main__":
         )  # actor and critic network have same number of layers
     if args.modules == []:
         args.modules = ["actor_network", "critic_network"]
-    layers = product(args.modules, args.layer_indicies)
+    layers = list(product(args.modules, args.layer_indicies))
     probes = []
+    probes_fn_dict = {}
     for module, layer in layers:
         layer_name = f"{module}.{layer}"
         print(f"\n\n====== Training CCS probe for {layer_name} ======")
@@ -502,7 +524,34 @@ if __name__ == "__main__":
         )
         ccs.repeated_train()
         probes.append(ccs)
+        probes_fn_dict[
+            f"Right player CCS probe on {layer_name}"
+        ] = lambda obs: ccs.elicit(obs[:1]).item()
+        probes_fn_dict[
+            f"Left player CCS probe on {layer_name}"
+        ] = lambda obs: ccs.elicit(obs[1:2]).item()
 
+    metrics = {
+        "Right player value": lambda obs: model.get_value(obs[:1]).item(),
+        "Left player value": lambda obs: model.get_value(obs[1:2]).item(),
+    }
+    metrics.update(probes_fn_dict)
+    video_path = (
+        Path("videos")
+        / "ccs_eval"
+        / args.model_name
+        / "_".join(f"{m}.{l}" for m, l in layers)
+    )
+    model.name = args.model_name.replace("/", "_")
+    playground(
+        env,
+        model,
+        model,
+        metrics,
+        args.device,
+        video_path,
+        rounds_to_record=args.rounds_to_record,
+    )
     # Evaluate probe against trajectory returns
     # print(
     #     "Best probe CCS eval metrics: v1_loss={:.5f}, v2_loss={:.5f}, avg_value_sum={:.5f}, avg_return_sum={:.5f}".format(
