@@ -74,7 +74,7 @@ if __name__ == "__main__":
         local_dir=hf_path,
     )
     agent1 = Agent(envs).to(device)
-    agent1.load(hf_path / args.agent1_path)
+    agent1.load(hf_path / args.agent1_path, device)
     agent1.requires_grad_(False)
     agent1.name = args.agent1_name
     if args.agent2_path == "":
@@ -87,11 +87,12 @@ if __name__ == "__main__":
         local_dir=hf_path,
     )
     agent2 = Agent(envs).to(device)
-    agent2.load(hf_path / args.agent2_path)
+    agent2.load(hf_path / args.agent2_path, device)
     agent2.requires_grad_(False)
     agent2.name = args.agent2_name
 
     video_path = Path("videos") / run_name
+    video_path.mkdir(parents=True, exist_ok=True)
     playground(
         envs,
         agent1,
