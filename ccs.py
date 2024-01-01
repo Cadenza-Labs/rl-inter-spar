@@ -13,7 +13,7 @@ from itertools import product
 # from imitation.data.rollout import generate_trajectories, make_sample_until
 # from imitation.data.serialize import save, load_with_rewards
 import argparse
-from agents.common import get_env, Agent, preprocess, playground
+from agents.common import get_env, Agent, preprocess
 from utils import strtobool
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm, trange
@@ -52,13 +52,13 @@ class TrajectoriesCollector:
                 next_obs, reward, done, infos = self.env.step(action)
                 traj["obs"].append(obs)
                 traj["actions"].append(action)
-                traj["rewards"].append(reward)
+                traj["rewards"].append(np.array(reward))
                 i += 1
                 i_episode += 1
                 obs = next_obs
                 if i % (steps // 10) == 0:
                     pbar.update(i)
-                if done.any() or (reward != 0).any():
+                if done.any():
                     i_episode = 0
                     traj["terminal"] = True
                     trajs.append(Trajectory(**traj))
@@ -68,6 +68,7 @@ class TrajectoriesCollector:
                         "rewards": [],
                         "terminal": False,
                     }
+                    obs = self.env.reset()
                     if i > steps:
                         break
         print(f"Generated {len(trajs)} trajectories.")
@@ -92,13 +93,12 @@ def generate_dataset(env, model_path, num_episodes, max_episode_length, seed, de
     return trajectories
 
 
-def load_data(dataset_path):
+def load_data(dataset_path, gamma):
     """Load trajectories"""
     with open(dataset_path, "rb") as file:
         dataset = pickle.load(file)
     observation_pairs = sum([traj.obs for traj in dataset], [])
-    reward_pairs = sum([traj.rewards for traj in dataset], [])
-    return_pairs = th.cat([calculate_returns(traj.rewards) for traj in dataset], dim=0)
+    return_pairs = th.cat([calculate_returns(traj.rewards, gamma) for traj in dataset], dim=0)
     return observation_pairs, return_pairs
 
 
@@ -132,13 +132,23 @@ def get_hidden_activations_dataset(module, device, dataset):
     return hidden_act_dataset
 
 
+def get_ball_positions(observation_pairs, device, ball_color=236):
+    """Returns tensor of ball positions (0=left player, 1=right player)."""
+    half_width = observation_pairs[0].shape[1] // 2
+    ball_positions = []
+    for pair in observation_pairs:
+        ball_pos = (pair == ball_color).sum(axis=1).argmax(axis=1) >= half_width
+        ball_positions.append(ball_pos)
+    return th.tensor(ball_positions, dtype=th.float).to(device)
+
+
 class ValueProbe(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.linear = nn.Linear(dim, 1)
 
     def forward(self, x):
-        h = self.linear(x.flatten(start_dim=1))
+        h = self.linear(x)
         return th.tanh(h)
 
 
@@ -146,14 +156,14 @@ def discount_cumsum(x, discount):
     """
     magic from rllab for computing discounted cumulative sums of vectors.
 
-    input:
-        vector x,
-        [x0,
-         x1,
+    input: 
+        vector x, 
+        [x0, 
+         x1, 
          x2]
 
     output:
-        [x0 + discount * x1 + discount^2 * x2,
+        [x0 + discount * x1 + discount^2 * x2,  
          x1 + discount * x2,
          x2]
     """
@@ -163,12 +173,7 @@ def discount_cumsum(x, discount):
 def calculate_returns(reward_pairs, gamma=0.99):
     """Calculate discounted returns for each step in given pair of reward histories."""
     reward_pairs = np.array(reward_pairs)
-    return_pairs = np.stack(
-        (
-            discount_cumsum(reward_pairs[:, 0], gamma),
-            discount_cumsum(reward_pairs[:, 1], gamma),
-        )
-    ).T
+    return_pairs = np.stack((discount_cumsum(reward_pairs[:, 0], gamma), discount_cumsum(reward_pairs[:, 1], gamma))).T
     return th.tensor(return_pairs)
 
 
@@ -178,7 +183,7 @@ class CCS:
     def __init__(
         self,
         env,
-        model,
+        module,
         layer_name,
         dataset_path,
         num_epochs=1000,
@@ -190,11 +195,11 @@ class CCS:
         weight_decay=0.01,
         var_normalize=False,
         val_fraction=0.2,
+        gamma=0.99,
         seed=42,
     ):
-        # TODO: refactor so that CCS has a self.layer_name and only handle this layer
         self.env = env
-        self.model = model
+        self.module = module
         self.layer_name = layer_name
         # training
         self.var_normalize = var_normalize
@@ -206,6 +211,7 @@ class CCS:
         self.batch_size = batch_size
         self.weight_decay = weight_decay
         self.val_fraction = val_fraction
+        self.gamma = gamma
         self.seed = seed
 
         if verbose:
@@ -214,7 +220,8 @@ class CCS:
         # TODO: we could store the activations of each layer in different files
         activations_path = dataset_path.with_suffix("") / "activations.pt"
         returns_path = dataset_path.with_suffix("") / "returns.pt"
-        if activations_path.exists():
+        ball_pos_path = dataset_path.with_suffix("") / "ball_pos.pt"
+        if activations_path.exists() and False:
             if verbose:
                 print(f"Found cached activations at: {activations_path}")
             activation_pairs = th.load(activations_path)
@@ -223,13 +230,15 @@ class CCS:
         else:
             if verbose:
                 print(f"No cached activations. Computing them...")
-            observation_pairs, return_pairs = load_data(dataset_path)
+            observation_pairs, return_pairs = load_data(dataset_path, gamma)
             activation_pairs = get_hidden_activations_dataset(
-                model, device, observation_pairs
+                module, device, observation_pairs
             )
+            ball_pos_pairs = get_ball_positions(observation_pairs, device)
             activations_path.parent.mkdir(parents=True, exist_ok=True)
             th.save(activation_pairs, activations_path)
             th.save(return_pairs, returns_path)
+            th.save(ball_pos_pairs, ball_pos_path)
         activation_pairs = (
             th.cat(
                 [pair[layer_name].unsqueeze(0) for pair in activation_pairs],
@@ -238,16 +247,27 @@ class CCS:
             .detach()
             .to(self.device)
         )
-        # TODO split returns with the same permutation and save as attribute for use
-        # in eval function
-        self.train_activations, self.test_activations = data_th.random_split(
-            activation_pairs,
-            lengths=[val_fraction, 1 - val_fraction],
-            generator=th.Generator().manual_seed(seed),
-        )
+
+        # normalize with respect to ball position
+
+        # split data
+        num_pairs = activation_pairs.shape[0]
+        perm = th.randperm(num_pairs, generator=th.Generator().manual_seed(seed))
+        permuted_activation_pairs = activation_pairs[perm]
+        permuted_ball_pos_pairs = ball_pos_pairs[perm]
+        permuted_return_pairs = return_pairs[perm]
+        split_idx = int((1 - val_fraction) * num_pairs)
+        self.train_activations, self.test_activations = permuted_activation_pairs[:split_idx], permuted_activation_pairs[split_idx:]
+        self.train_ball_pos, self.test_ball_pos = permuted_ball_pos_pairs[:split_idx], permuted_ball_pos_pairs[split_idx:]
+        self.train_returns, self.test_returns = permuted_return_pairs[:split_idx], permuted_return_pairs[split_idx:]
+        #self.train_activations, self.test_activations = data_th.random_split(
+        #    activation_pairs,
+        #    lengths=[val_fraction, 1 - val_fraction],
+        #    generator=th.Generator().manual_seed(seed),
+        #)
 
     def initialize_probe(self):
-        dim = self.train_activations[0][0].flatten().shape[0]
+        dim = self.train_activations[0].shape[-1]
         return ValueProbe(dim).to(self.device)
 
     def normalize(self, activations):
@@ -268,65 +288,22 @@ class CCS:
         consistent_loss = ((value_1 + value_2) ** 2).mean(0)
         return consistent_loss + informative_loss
 
-    def get_return_metrics(self, probe):
-        raise NotImplementedError("TODO: Return metric needs to be adapted")
+    def get_return_metrics(self):
         """Computes metrics of value probe against trajectory returns."""
         num_trajs = len(self.test_activations)
-        traj_lengths = [
-            len(self.test_activations[i][0][layer_name]) for i in range(num_trajs)
-        ]
         x0 = (
-            th.cat(
-                [self.test_activations[i][0][layer_name] for i in range(num_trajs)],
-                axis=0,
-            )
+            self.test_activations[:, 0]
             .detach()
             .to(self.device)
         )
         x1 = (
-            th.cat(
-                [self.test_activations[i][1][layer_name] for i in range(num_trajs)],
-                axis=0,
-            )
+            self.test_activations[:, 1]
             .detach()
             .to(self.device)
         )
         # compute returns from trajectory data assuming gamma=1
-        return_1 = (
-            th.cat(
-                [
-                    th.flip(
-                        th.cumsum(
-                            th.flip(th.tensor(self.test_data[i].rews), dims=(0,)),
-                            dim=0,
-                        ),
-                        dims=(0,),
-                    )
-                    for i in range(num_trajs)
-                ],
-                axis=0,
-            )
-            .detach()
-            .to(self.device)
-        )
-        # TODO here we make the assumption that player 2 reward is the negative of player 1
-        return_2 = (
-            th.cat(
-                [
-                    th.flip(
-                        th.cumsum(
-                            th.flip(-th.tensor(self.test_data[i].rews), dims=(0,)),
-                            dim=0,
-                        ),
-                        dims=(0,),
-                    )
-                    for i in range(num_trajs)
-                ],
-                axis=0,
-            )
-            .detach()
-            .to(self.device)
-        )
+        return_1 = self.test_returns[:, 0].detach().to(self.device)
+        return_2 = self.test_returns[:, 1].detach().to(self.device)
         with th.no_grad():
             value_1, value_2 = self.best_probe(x0), self.best_probe(x1)
         avg_value_sum = (value_1 + value_2).mean()
@@ -353,15 +330,6 @@ class CCS:
             train_loss += self.get_loss(v0, v1)
         return train_loss
 
-    @th.no_grad()
-    def elicit(self, obs):
-        """
-        Elicit a value from the model using `self.best_probe` for a given observation
-        """
-        obs = preprocess(obs)
-        _, activations = nice_hooks.run(self.model, obs, return_activations=True)
-        return self.best_probe(activations[self.layer_name])
-
     def train(self, probe):
         """Train a single probe on its layer."""
         batch_size = (
@@ -382,6 +350,9 @@ class CCS:
                 x0_batch = batch[:, 0]
                 x1_batch = batch[:, 1]
                 # probe
+                # TODO Before passing activations into the probe, normalize each activation vector 
+                # that comes from a board state with the ball [closer to] / [further from] you by 
+                # subtracting the mean of all activation vectors with the ball respectively [closer to] / [further from] you
                 v0, v1 = probe(x0_batch), probe(x1_batch)
 
                 # get the corresponding loss
@@ -389,6 +360,7 @@ class CCS:
 
                 # update the parameters
                 optimizer.zero_grad()
+                # TODO fix loss not being scalar at some point
                 loss.backward()
                 optimizer.step()
         return self.evaluate(probe, dataloader)
@@ -458,12 +430,6 @@ if __name__ == "__main__":
         nargs="*",
         default=[],
     )
-    parser.add_argument(
-        "--rounds_to_record",
-        help="The number of rounds to record",
-        type=int,
-        default=30,
-    )
     args = parser.parse_args()
     # TODO? support multiple envs
     args.num_envs = 2
@@ -508,11 +474,10 @@ if __name__ == "__main__":
         )  # actor and critic network have same number of layers
     if args.modules == []:
         args.modules = ["actor_network", "critic_network"]
-    layers = list(product(args.modules, args.layer_indicies))
+    layers = product(args.modules, args.layer_indicies)
     probes = []
-    probes_fn_dict = {}
     for module, layer in layers:
-        layer_name = f"{module}.{layer}"
+        layer_name = f"{module}" #.{layer}"
         print(f"\n\n====== Training CCS probe for {layer_name} ======")
         ccs = CCS(
             env,
@@ -520,41 +485,15 @@ if __name__ == "__main__":
             layer_name,
             data_save_path,
             device=args.device,
+            num_tries=1,
             # verbose=True,
         )
         ccs.repeated_train()
         probes.append(ccs)
-        probes_fn_dict[
-            f"Right player CCS probe on {layer_name}"
-        ] = lambda obs: ccs.elicit(obs[:1]).item()
-        probes_fn_dict[
-            f"Left player CCS probe on {layer_name}"
-        ] = lambda obs: ccs.elicit(obs[1:2]).item()
 
-    metrics = {
-        "Right player value": lambda obs: model.get_value(obs[:1]).item(),
-        "Left player value": lambda obs: model.get_value(obs[1:2]).item(),
-    }
-    metrics.update(probes_fn_dict)
-    video_path = (
-        Path("videos")
-        / "ccs_eval"
-        / args.model_name
-        / "_".join(f"{m}.{l}" for m, l in layers)
-    )
-    model.name = args.model_name.replace("/", "_")
-    playground(
-        env,
-        model,
-        model,
-        metrics,
-        args.device,
-        video_path,
-        rounds_to_record=args.rounds_to_record,
-    )
     # Evaluate probe against trajectory returns
-    # print(
-    #     "Best probe CCS eval metrics: v1_loss={:.5f}, v2_loss={:.5f}, avg_value_sum={:.5f}, avg_return_sum={:.5f}".format(
-    #         *ccs.get_return_metrics()
-    #     )
-    # )
+    print(
+         "Best probe CCS eval metrics: v1_loss={:.5f}, v2_loss={:.5f}, avg_value_sum={:.5f}, avg_return_sum={:.5f}".format(
+             *ccs.get_return_metrics()
+         )
+    )
