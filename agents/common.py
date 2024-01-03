@@ -204,11 +204,14 @@ def playground(
             rounds_to_record -= 1
         if dones[0] or rounds_to_record == 0 or len(frames) > max_video_length:
             print(f"SPS: {total_length  / (time.time() - start_time)}")
-            print(f"{player1.name} vs {player2.name}: {num_rounds} rounds played")
-            print(
-                f"{player1.name} vs {player2.name}: {wins} wins /  {num_rounds - wins} losses"
-            )
-            print(f"Average episode length: {total_length / num_rounds}")
+            if num_rounds > 0:
+                print(f"{player1.name} vs {player2.name}: {num_rounds} rounds played")
+                print(
+                    f"{player1.name} vs {player2.name}: {wins} wins /  {num_rounds - wins} losses"
+                )
+                print(f"Average episode length: {total_length / num_rounds}")
+            else:
+                print("No rounds finished")
             frames = np.stack(frames, dtype=np.uint8)
             total_frames = min(len(frames), max_video_length)
             time_values = list(range(total_frames))
@@ -241,10 +244,14 @@ def playground(
                 return game_render, plots
 
             def save_video():
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-
+                fig, (ax1, ax2, lax) = plt.subplots(
+                    1, 3, figsize=(12, 6), layout="constrained"
+                )
                 game_render, plots = init_plot(ax1, ax2)
-                ax2.legend()
+                h, l = ax2.get_legend_handles_labels()
+                lax.legend(h, l, borderaxespad=0)
+                lax.axis("off")
+
                 # Update function for animation
                 pbar = tqdm(total=total_frames)
 
@@ -266,13 +273,14 @@ def playground(
 
                 # Save value plot as a png
                 video_path.mkdir(parents=True, exist_ok=True)
+                fig.tight_layout()
                 fig.savefig(str(video_path / f"{player1.name}_vs_{player2.name}.png"))
                 pbar.set_description("Generating video")
                 animation.save(
                     str(video_path / f"{player1.name}_vs_{player2.name}.mp4"), fps=30
                 )
                 print(
-                    "Saved video to"
+                    "Saved video to "
                     + str(video_path / f"{player1.name}_vs_{player2.name}.mp4")
                 )
 
@@ -287,7 +295,9 @@ def playground(
                 mplstyle.use("fast")
                 from matplotlib.widgets import Slider, Button, CheckButtons
 
-                fig, (ax1, ax2, rax) = plt.subplots(1, 3, figsize=(12, 6), width_ratios=[3, 3, 1])
+                fig, (ax1, ax2, rax) = plt.subplots(
+                    1, 3, figsize=(12, 6), width_ratios=[3, 3, 1]
+                )
                 game_render, plots = init_plot(ax1, ax2)
 
                 class SetAnimationFrame:
@@ -350,16 +360,20 @@ def playground(
                 visibility = [False] * len(labels)
                 visibility[:2] = [True] * 2
                 plot_colors = [plot.get_color() for plot in plots]
-                check = CheckButtons(rax, labels, visibility, label_props={"color": plot_colors})
+                check = CheckButtons(
+                    rax, labels, visibility, label_props={"color": plot_colors}
+                )
                 label_to_plot = {plot.get_label(): plot for plot in plots}
-                
+                label_to_index = {label: i for i, label in enumerate(labels)}
+                for plot in plots[2:]:
+                    plot.set_visible(False)
 
-                def callback(label):
+                def checkbox_callback(label):
                     plot = label_to_plot[label]
-                    plot.set_visible(not plot.get_visible())
+                    plot.set_visible(check.get_status()[label_to_index[label]])
                     plot.figure.canvas.draw_idle()
 
-                check.on_clicked(callback)
+                check.on_clicked(checkbox_callback)
 
                 def on_changed(val):
                     nonlocal lock_slider
@@ -381,6 +395,7 @@ def playground(
 
                 time_slider.on_changed(on_changed)
                 media_button.on_clicked(play_pause)
+                plt.tight_layout()
                 if video_path is not None:
                     video_thread.start()
                 plt.show()
