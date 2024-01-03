@@ -146,8 +146,6 @@ class Agent(nn.Module):
         return th.tensor(0).to(x.device)  # Dummy return
 
 
-
-
 @th.no_grad()
 def playground(
     envs,
@@ -155,12 +153,26 @@ def playground(
     agent2,
     metrics: dict,
     device,
-    video_path,
+    video_path=None,
     rounds_to_record=30,
     max_video_length=2000,
     sliding_window=100,
     interactive=True,
 ):
+    """
+    Play a game between two agents and record metrics.
+    Args:
+        envs: The vectorized environment
+        agent1: The first agent
+        agent2: The second agent
+        metrics: A dictionary of metrics to record
+        device: The device to run the agents on
+        video_path: The path to save the video to. If None, no video will be recorded
+        rounds_to_record: The number of rounds to record
+        max_video_length: The maximum number of frames to record
+        sliding_window: The sliding window for the value plot
+        interactive: If toggled, an interactive plot will be shown
+    """
     # The video wrapper is not working with our env so we have to use our own. So we will save the first round of each match as a video:
     player1 = agent1
     player2 = agent2
@@ -190,7 +202,7 @@ def playground(
         wins += (rewards[::2] == 1).sum().item()
         if rewards[0] != 0:
             rounds_to_record -= 1
-        if dones[0] or rounds_to_record == 0:
+        if dones[0] or rounds_to_record == 0 or len(frames) > max_video_length:
             print(f"SPS: {total_length  / (time.time() - start_time)}")
             print(f"{player1.name} vs {player2.name}: {num_rounds} rounds played")
             print(
@@ -199,7 +211,6 @@ def playground(
             print(f"Average episode length: {total_length / num_rounds}")
             frames = np.stack(frames, dtype=np.uint8)
             total_frames = min(len(frames), max_video_length)
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
             time_values = list(range(total_frames))
 
             def init_plot(ax1, ax2):
@@ -229,32 +240,33 @@ def playground(
                 ax2.set_title("Value over time")
                 return game_render, plots
 
-            game_render, plots = init_plot(ax1, ax2)
-            ax2.legend()
-            # Update function for animation
-            pbar = tqdm(total=total_frames)
-
-            def update(frame):
-                pbar.n = frame
-                pbar.refresh()
-                game_render.set_array(frames[frame])
-                for plot, values in zip(plots, metric_values.values()):
-                    plot.set_data(
-                        time_values[max(0, frame - sliding_window) : frame + 1],
-                        values[max(0, frame - sliding_window) : frame + 1],
-                    )
-                if frame > sliding_window:
-                    ax2.set_xlim(frame - sliding_window, frame)
-                return [game_render] + plots
-
-            # Create the animation
-            animation = FuncAnimation(fig, update, frames=total_frames, blit=True)
-
-            # Save value plot as a png
-            fig.savefig(str(video_path / f"{player1.name}_vs_{player2.name}.png"))
-
             def save_video():
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+                game_render, plots = init_plot(ax1, ax2)
+                ax2.legend()
+                # Update function for animation
+                pbar = tqdm(total=total_frames)
+
+                def update(frame):
+                    pbar.n = frame
+                    pbar.refresh()
+                    game_render.set_array(frames[frame])
+                    for plot, values in zip(plots, metric_values.values()):
+                        plot.set_data(
+                            time_values[max(0, frame - sliding_window) : frame + 1],
+                            values[max(0, frame - sliding_window) : frame + 1],
+                        )
+                    if frame > sliding_window:
+                        ax2.set_xlim(frame - sliding_window, frame)
+                    return [game_render] + plots
+
+                # Create the animation
+                animation = FuncAnimation(fig, update, frames=total_frames, blit=True)
+
+                # Save value plot as a png
                 video_path.mkdir(parents=True, exist_ok=True)
+                fig.savefig(str(video_path / f"{player1.name}_vs_{player2.name}.png"))
                 pbar.set_description("Generating video")
                 animation.save(
                     str(video_path / f"{player1.name}_vs_{player2.name}.mp4"), fps=30
@@ -263,29 +275,22 @@ def playground(
                     "Saved video to"
                     + str(video_path / f"{player1.name}_vs_{player2.name}.mp4")
                 )
-            
+
             # Save video in a separate thread
-            video_thread = threading.Thread(target=save_video)
-            video_thread.start()
+            if video_path is not None:
+                video_thread = threading.Thread(target=save_video)
 
             # Create interactive plot if requested
             if interactive:
-                import matplotlib
+                import matplotlib.style as mplstyle
 
-                matplotlib.use("WebAgg")
-                """
-                The UI includes:
-                 - a slider to control the size of the sliding window
-                 - a button to pause the animation
-                 - a slider to control the frame of the animation
-                """
+                mplstyle.use("fast")
                 from matplotlib.widgets import Slider, Button
-                
 
                 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
                 game_render, plots = init_plot(ax1, ax2)
 
-                class SetAnimationFrame():
+                class SetAnimationFrame:
                     def __init__(self, num_frames):
                         self.num_frames = num_frames
                         self.frame = 0
@@ -295,11 +300,17 @@ def playground(
                         if frame != self.last_frame:
                             self.frame = (self.frame + 1) % self.num_frames
                         return self.frame
-                
+
                 current_frame = SetAnimationFrame(total_frames)
 
-                def update(frame):
-                    # frame = current_frame(frame)
+                lock_slider = False
+
+                def update(_frame):
+                    nonlocal lock_slider
+                    frame = current_frame(_frame)
+                    if _frame is not None and time_slider.val != frame:
+                        lock_slider = True
+                        time_slider.set_val(frame)
                     game_render.set_array(frames[frame])
                     for plot, values in zip(plots, metric_values.values()):
                         plot.set_data(
@@ -308,15 +319,14 @@ def playground(
                         )
                     if frame > sliding_window:
                         ax2.set_xlim(frame - sliding_window, frame)
-                    fig.canvas.draw_idle()
+                    else:
+                        ax2.set_xlim(0, sliding_window)
+                    # Draw idle ax2
+                    return [game_render] + plots
 
-                interactive_animation = FuncAnimation(
-                    fig, update, frames=total_frames, blit=True
-                )
-
-                # Create the slider and the button to control time below the game render
-                ax_time = plt.axes([0.25, 0.01, 0.65, 0.03])
-                ax_media = plt.axes([0.1, 0.01, 0.1, 0.03])
+                # # Create the slider and the button to control time below the game render
+                ax_time = fig.add_axes([0.25, 0.01, 0.65, 0.03])
+                ax_media = fig.add_axes([0.1, 0.01, 0.1, 0.03])
                 time_slider = Slider(
                     ax_time,
                     "Time",
@@ -326,25 +336,36 @@ def playground(
                     valstep=1,
                     valfmt="%d",
                 )
+                interactive_animation = FuncAnimation(
+                    fig, update, frames=total_frames, blit=False, interval=1000 / 60
+                )
                 # Play/pause button
                 media_button = Button(ax_media, "||", hovercolor="0.975")
 
-                
-
-                def update_slider(val):
+                def on_changed(val):
+                    nonlocal lock_slider
+                    if lock_slider:
+                        lock_slider = False
+                        return
                     frame = int(val)
                     current_frame.frame = frame - 1
-                    update(None)
+                    if val >= 0:
+                        update(None)
 
-                def play_pause(event):
+                def play_pause(_event):
                     if media_button.label.get_text() == "||":
                         media_button.label.set_text("▶")
                         interactive_animation.event_source.stop()
                     else:
                         media_button.label.set_text("||")
                         interactive_animation.event_source.start()
-                time_slider.on_changed(update_slider)
+
+                time_slider.on_changed(on_changed)
                 media_button.on_clicked(play_pause)
+                if video_path is not None:
+                    video_thread.start()
                 plt.show()
-            video_thread.join()
+
+            if video_path is not None:
+                video_thread.join()
             break

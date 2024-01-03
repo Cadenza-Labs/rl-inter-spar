@@ -31,9 +31,9 @@ def parse_args():
     parser.add_argument("--num-envs", type=int, default=16,
     help="the number of parallel game environments")
     parser.add_argument("--max-video-length", type=int, default=2000)
-    parser.add_argument("--num-rounds", type=int, default=30,
+    parser.add_argument("--num-rounds", type=int, default=5,
         help="the number of rounds to record")
-    parser.add_argument("--sliding-window", type=int, default=1000,
+    parser.add_argument("--sliding-window", type=int, default=200,
         help="the sliding window for the value plot")
     parser.add_argument("--agent1-path", type=str, required=True,
         help="the path to the first agent to be loaded")
@@ -43,6 +43,10 @@ def parse_args():
         help="the path to the second agent to be loaded, defaults to the first agent")
     parser.add_argument("--agent2-name", type=str, default="",
         help="the name of the second agent to be loaded")
+    parser.add_argument("--interactive", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="if toggled, an interactive plot will be shown")
+    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="if toggled, video will be recorded")
     args = parser.parse_args()
     # fmt: on
     return args
@@ -90,9 +94,10 @@ if __name__ == "__main__":
     agent2.load(hf_path / args.agent2_path, device)
     agent2.requires_grad_(False)
     agent2.name = args.agent2_name
-
-    video_path = Path("videos") / run_name
-    video_path.mkdir(parents=True, exist_ok=True)
+    if args.capture_video:
+        video_path = Path("videos") / run_name
+    else:
+        video_path = None
     playground(
         envs,
         agent1,
@@ -103,6 +108,7 @@ if __name__ == "__main__":
         },
         device,
         video_path,
+        interactive=args.interactive,
         rounds_to_record=args.num_rounds,
         max_video_length=args.max_video_length,
         sliding_window=args.sliding_window,
