@@ -285,9 +285,9 @@ def playground(
                 import matplotlib.style as mplstyle
 
                 mplstyle.use("fast")
-                from matplotlib.widgets import Slider, Button
+                from matplotlib.widgets import Slider, Button, CheckButtons
 
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+                fig, (ax1, ax2, rax) = plt.subplots(1, 3, figsize=(12, 6), width_ratios=[3, 3, 1])
                 game_render, plots = init_plot(ax1, ax2)
 
                 class SetAnimationFrame:
@@ -341,6 +341,25 @@ def playground(
                 )
                 # Play/pause button
                 media_button = Button(ax_media, "||", hovercolor="0.975")
+
+                # Make checkbuttons with all plotted lines with correct visibility
+                rax.set_title("Metrics")
+                # Hide box
+                rax.set_frame_on(False)
+                labels = [str(plot.get_label()) for plot in plots]
+                visibility = [False] * len(labels)
+                visibility[:2] = [True] * 2
+                plot_colors = [plot.get_color() for plot in plots]
+                check = CheckButtons(rax, labels, visibility, label_props={"color": plot_colors})
+                label_to_plot = {plot.get_label(): plot for plot in plots}
+                
+
+                def callback(label):
+                    plot = label_to_plot[label]
+                    plot.set_visible(not plot.get_visible())
+                    plot.figure.canvas.draw_idle()
+
+                check.on_clicked(callback)
 
                 def on_changed(val):
                     nonlocal lock_slider
