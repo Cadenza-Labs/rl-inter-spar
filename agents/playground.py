@@ -65,7 +65,6 @@ if __name__ == "__main__":
     device = th.device("cuda" if th.cuda.is_available() and args.cuda else "cpu")
     hf_path = Path(__file__).resolve().parent.parent / "hf_models"
     # env setup
-    args.capture_video = True
     envs = get_env(args, run_name)
 
     # agent loading
