@@ -156,8 +156,9 @@ def playground(
     video_path=None,
     rounds_to_record=30,
     max_video_length=2000,
-    sliding_window=100,
+    sliding_window=200,
     interactive=True,
+    file_name=None,
 ):
     """
     Play a game between two agents and record metrics.
@@ -172,6 +173,7 @@ def playground(
         max_video_length: The maximum number of frames to record
         sliding_window: The sliding window for the value plot
         interactive: If toggled, an interactive plot will be shown
+        file_name: The name of the file to save the video to (without the extension), if None, the video will be saved as player1_vs_player2.{ext}
     """
     # The video wrapper is not working with our env so we have to use our own. So we will save the first round of each match as a video:
     player1 = agent1
@@ -274,19 +276,17 @@ def playground(
                 # Save value plot as a png
                 video_path.mkdir(parents=True, exist_ok=True)
                 fig.tight_layout()
-                fig.savefig(str(video_path / f"{player1.name}_vs_{player2.name}.png"))
+                f_name = file_name or f"{player1.name}_vs_{player2.name}"
                 pbar.set_description("Generating video")
-                animation.save(
-                    str(video_path / f"{player1.name}_vs_{player2.name}.mp4"), fps=30
-                )
-                print(
-                    "Saved video to "
-                    + str(video_path / f"{player1.name}_vs_{player2.name}.mp4")
-                )
+                animation.save(str(video_path / f"{f_name}.mp4"), fps=30)
+                print("Saved video to " + str(video_path / f"{f_name}.mp4"))
 
             # Save video in a separate thread
-            if video_path is not None:
-                video_thread = threading.Thread(target=save_video)
+            if video_path is not None: 
+                if interactive:
+                    video_thread = threading.Thread(target=save_video)
+                else:
+                    save_video()
 
             # Create interactive plot if requested
             if interactive:
@@ -400,6 +400,7 @@ def playground(
                     video_thread.start()
                 plt.show()
 
-            if video_path is not None:
+            if video_path is not None and interactive:
                 video_thread.join()
+                
             break
