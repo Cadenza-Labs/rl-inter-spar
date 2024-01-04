@@ -200,7 +200,7 @@ def playground(
         frames.append(np.stack([frame, frame, frame], axis=2))
         obs = th.Tensor(obs).to(device)
         num_rounds += np.logical_or(rewards > 0, dones).sum().item()
-        total_length += 1 * obs.shape[0]
+        total_length += obs.shape[0] // 2
         wins += (rewards[::2] == 1).sum().item()
         if rewards[0] != 0:
             rounds_to_record -= 1
@@ -281,15 +281,10 @@ def playground(
                 animation.save(str(video_path / f"{f_name}.mp4"), fps=30)
                 print("Saved video to " + str(video_path / f"{f_name}.mp4"))
 
-            # Save video in a separate thread
-            if video_path is not None: 
-                if interactive:
-                    video_thread = threading.Thread(target=save_video)
-                else:
-                    save_video()
-
             # Create interactive plot if requested
             if interactive:
+                if video_path is not None:
+                    warnings.warn("Warning: The video won't be saved until the interactive plot is closed")
                 import matplotlib.style as mplstyle
 
                 mplstyle.use("fast")
@@ -396,11 +391,9 @@ def playground(
                 time_slider.on_changed(on_changed)
                 media_button.on_clicked(play_pause)
                 plt.tight_layout()
-                if video_path is not None:
-                    video_thread.start()
                 plt.show()
 
-            if video_path is not None and interactive:
-                video_thread.join()
-                
+            if video_path is not None:
+                save_video()
+
             break
