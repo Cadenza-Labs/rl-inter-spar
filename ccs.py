@@ -15,12 +15,13 @@ import csv
 # from imitation.data.rollout import generate_trajectories, make_sample_until
 # from imitation.data.serialize import save, load_with_rewards
 import argparse
-from agents.common import get_env, Agent, preprocess, playground
+from agents.common import get_env, Agent, preprocess
 from utils import strtobool
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm, trange
 from dataclasses import dataclass
 from nicehooks import nice_hooks
+from probe_visualization import ProbeMonitor
 
 HF_PATH = Path("hf_models")
 DATASET_PATH = Path("datasets")
@@ -462,6 +463,8 @@ class CCS:
                 writer.writerow(
                     [
                         self.layer_name,
+                        best_loss.item(),
+                        test_loss_best.item(),
                         self.num_epochs,
                         self.num_tries,
                         self.learning_rate,
@@ -470,14 +473,12 @@ class CCS:
                         self.val_fraction,
                         self.seed,
                         self.var_normalize,
-                        best_loss,
-                        test_loss_best,
                     ]
                 )
         return best_loss
 
 
-if __name__ == "__main__":
+def parse_args():
     parser = argparse.ArgumentParser("Run CCS on a given model and environment.")
     env_group = parser.add_argument_group("Environment and model")
     env_group.add_argument(
@@ -547,22 +548,28 @@ if __name__ == "__main__":
         const=True,
         default=True,
     )
-    playground_group = parser.add_argument_group(
-        "Playground", "Parameters for the probe visualization across time"
+    vis_group = parser.add_argument_group(
+        "Visualization", "Parameters for the probe visualization across time"
     )
-    playground_group.add_argument(
+    vis_group.add_argument(
         "--rounds-to-record",
         help="The number of rounds to record",
         type=int,
         default=3,
     )
-    playground_group.add_argument(
+    vis_group.add_argument(
+        "--max-num-steps",
+        help="The maximum number of steps to record",
+        type=int,
+        default=10000,
+    )
+    vis_group.add_argument(
         "--max-video-length",
         help="The maximum length of the recorded videos",
         type=int,
         default=6000,
     )
-    playground_group.add_argument(
+    vis_group.add_argument(
         "--interactive",
         help="Whether to run in interactive mode",
         type=lambda x: bool(strtobool(x)),
@@ -570,21 +577,41 @@ if __name__ == "__main__":
         const=True,
         default=False,
     )
-    playground_group.add_argument(
-        "--record-probe-video",
-        help="Whether to record videos of the probes values across time",
+    vis_group.add_argument(
+        "--record-probe-videos",
+        help="Whether to record a videos of each probe value across time",
         type=lambda x: bool(strtobool(x)),
         nargs="?",
         const=True,
         default=False,
     )
-    playground_group.add_argument(
+    vis_group.add_argument(
+        "--record-video-with-all-probes",
+        help="Whether to record a video with all probes values across time",
+        type=lambda x: bool(strtobool(x)),
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    vis_group.add_argument(
+        "--record-agent-value",
+        help="Whether to record the agents values across time in the probe video",
+        type=lambda x: bool(strtobool(x)),
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    vis_group.add_argument(
         "--sliding-window",
         help="The size of the sliding window for the probe visualization",
         type=int,
         default=200,
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
     # TODO? support multiple envs
     args.num_envs = 2
     env = get_env(args, "ccs")
@@ -665,39 +692,46 @@ if __name__ == "__main__":
     metrics.update(probes_fn_dict)
     video_path = Path("videos") / "ccs_eval" / args.model_name
     model.name = args.model_name.replace("/", "_")
-    if args.interactive or args.record_probe_video:
-        playground(
+    if (
+        args.interactive
+        or args.record_probe_videos
+        or args.record_video_with_all_probes
+    ):
+        monitor = ProbeMonitor(
             env,
             model,
             model,
             metrics,
             args.device,
-            video_path / "_".join(f"{m}.{l}" for m, l in layers)
-            if args.record_probe_video
-            else None,
-            file_name=f"ccs_eval_{int(time.time())}",
-            rounds_to_record=args.rounds_to_record,
-            max_video_length=args.max_video_length,
-            interactive=args.interactive,
-            sliding_window=args.sliding_window,
         )
-    if args.record_probe_video:
-        # Create a video for each probe
-        # Note: A lot of computation is duplicated here. We could avoid this by refactoring playground
-        for probe_dict, layer_name in zip(probes_fn_dict_list, layer_names):
-            playground(
-                env,
-                model,
-                model,
-                probe_dict,
-                args.device,
-                video_path / layer_name,
+        monitor.run(
+            args.rounds_to_record,
+            args.max_num_steps,
+        )
+        if args.interactive:
+            monitor.interactive_visualization(args.sliding_window)
+        if args.record_video_with_all_probes:
+            monitor.save_video(
+                metrics.keys(),
+                video_path / "_".join(f"{m}.{l}" for m, l in layers),
                 file_name=f"ccs_eval_{int(time.time())}",
-                interactive=False,
-                rounds_to_record=args.rounds_to_record,
-                max_video_length=args.max_video_length,
                 sliding_window=args.sliding_window,
             )
+        if args.record_probe_videos:
+            # Create a video for each probe
+            # Notes: A lot of computation is duplicated here. We could avoid this by refactoring playground
+            for probe_dict, layer_name in zip(probes_fn_dict_list, layer_names):
+                extra_metrics = (
+                    ["Right player value", "Left player value"]
+                    if args.record_agent_value
+                    else []
+                )
+                monitor.save_video(
+                    list(probe_dict.keys()) + extra_metrics,
+                    video_path / layer_name,
+                    file_name=f"ccs_eval_{int(time.time())}",
+                )
+
     # Evaluate probe against trajectory returns
     # print(
     #     "Best probe CCS eval metrics: v1_loss={:.5f}, v2_loss={:.5f}, avg_value_sum={:.5f}, avg_return_sum={:.5f}".format(
