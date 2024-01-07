@@ -55,13 +55,13 @@ class TrajectoriesCollector:
                 next_obs, reward, done, infos = self.env.step(action)
                 traj["obs"].append(obs)
                 traj["actions"].append(action)
-                traj["rewards"].append(np.array(reward))
+                traj["rewards"].append(reward)
                 i += 1
                 i_episode += 1
                 obs = next_obs
                 if i % (steps // 10) == 0:
                     pbar.update(i)
-                if done.any():
+                if done.any() or (reward != 0).any():
                     i_episode = 0
                     traj["terminal"] = True
                     trajs.append(Trajectory(**traj))
@@ -71,7 +71,6 @@ class TrajectoriesCollector:
                         "rewards": [],
                         "terminal": False,
                     }
-                    obs = self.env.reset()
                     if i > steps:
                         break
         print(f"Generated {len(trajs)} trajectories.")
@@ -159,14 +158,14 @@ def discount_cumsum(x, discount):
     """
     magic from rllab for computing discounted cumulative sums of vectors.
 
-    input: 
-        vector x, 
-        [x0, 
-         x1, 
+    input:
+        vector x,
+        [x0,
+         x1,
          x2]
 
     output:
-        [x0 + discount * x1 + discount^2 * x2,  
+        [x0 + discount * x1 + discount^2 * x2,
          x1 + discount * x2,
          x2]
     """
@@ -176,7 +175,12 @@ def discount_cumsum(x, discount):
 def calculate_returns(reward_pairs, gamma=0.99):
     """Calculate discounted returns for each step in given pair of reward histories."""
     reward_pairs = np.array(reward_pairs)
-    return_pairs = np.stack((discount_cumsum(reward_pairs[:, 0], gamma), discount_cumsum(reward_pairs[:, 1], gamma))).T
+    return_pairs = np.stack(
+        (
+            discount_cumsum(reward_pairs[:, 0], gamma),
+            discount_cumsum(reward_pairs[:, 1], gamma),
+        )
+    ).T
     return th.tensor(return_pairs)
 
 
@@ -273,18 +277,20 @@ class CCS:
             .detach()
             .to(self.device)
         )
+        # average over stacked frames
+        ball_pos_pairs = ball_pos_pairs.mean(axis=-1) > 0.5
 
-        # normalize with respect to ball position
+        activation_pairs = self.normalize_wrt_ball_position(activation_pairs, ball_pos_pairs)
 
         # split data
         num_pairs = activation_pairs.shape[0]
         perm = th.randperm(num_pairs, generator=th.Generator().manual_seed(seed))
         permuted_activation_pairs = activation_pairs[perm]
-        permuted_ball_pos_pairs = ball_pos_pairs[perm]
+        # permuted_ball_pos_pairs = ball_pos_pairs[perm]
         permuted_return_pairs = return_pairs[perm]
         split_idx = int((1 - val_fraction) * num_pairs)
         self.train_activations, self.test_activations = permuted_activation_pairs[:split_idx], permuted_activation_pairs[split_idx:]
-        self.train_ball_pos, self.test_ball_pos = permuted_ball_pos_pairs[:split_idx], permuted_ball_pos_pairs[split_idx:]
+        # self.train_ball_pos, self.test_ball_pos = permuted_ball_pos_pairs[:split_idx], permuted_ball_pos_pairs[split_idx:]
         self.train_returns, self.test_returns = permuted_return_pairs[:split_idx], permuted_return_pairs[split_idx:]
         #self.train_activations, self.test_activations = data_th.random_split(
         #    activation_pairs,
@@ -306,6 +312,31 @@ class CCS:
             normalized_x /= normalized_x.std(axis=0, keepdims=True)
 
         return normalized_x
+
+    def normalize_wrt_ball_position(self, activation_pairs, ball_pos_pairs):
+        """
+        Normalize activations with respect to the ball position for each player separately.
+        """
+        # TODO: it might not be necessary to 
+        # normalize separately for each player; Probably create another method to test that.
+        indices_player1_left = th.where(ball_pos_pairs[:, 0] == 0)[0]
+        indices_player1_right = th.where(ball_pos_pairs[:, 0] == 1)[0]
+        indices_player2_left = th.where(ball_pos_pairs[:, 1] == 0)[0]
+        indices_player2_right = th.where(ball_pos_pairs[:, 1] == 1)[0]
+        activations_player1_left = self.normalize(activation_pairs[:, 0][indices_player1_left])
+        activations_player1_right = self.normalize(activation_pairs[:, 0][indices_player1_right])
+        activations_player2_left = self.normalize(activation_pairs[:, 1][indices_player2_left])
+        activations_player2_right = self.normalize(activation_pairs[:, 1][indices_player2_right])
+
+        # Place the normalized activations back into the combined arrays
+        combined_activations_player1 = th.zeros_like(activation_pairs[:, 0])
+        combined_activations_player2 = th.zeros_like(activation_pairs[:, 1])
+        combined_activations_player1[indices_player1_left] = activations_player1_left
+        combined_activations_player1[indices_player1_right] = activations_player1_right
+        combined_activations_player2[indices_player2_left] = activations_player2_left
+        combined_activations_player2[indices_player2_right] = activations_player2_right
+
+        return th.stack((combined_activations_player1, combined_activations_player2), dim=1)
 
     def get_loss(self, value_1, value_2):
         """Returns the CCS loss for two values each of shape (n,1) or (n,)."""
@@ -356,6 +387,15 @@ class CCS:
             train_loss += self.get_loss(v0, v1)
         return train_loss
 
+    @th.no_grad()
+    def elicit(self, obs):
+        """
+        Elicit a value from the model using `self.best_probe` for a given observation
+        """
+        obs = preprocess(obs)
+        _, activations = nice_hooks.run(self.module, obs, return_activations=True)
+        return self.best_probe(activations[self.layer_name])
+
     def train(self, probe):
         """Train a single probe on its layer."""
         batch_size = (
@@ -376,9 +416,6 @@ class CCS:
                 x0_batch = batch[:, 0]
                 x1_batch = batch[:, 1]
                 # probe
-                # TODO Before passing activations into the probe, normalize each activation vector 
-                # that comes from a board state with the ball [closer to] / [further from] you by 
-                # subtracting the mean of all activation vectors with the ball respectively [closer to] / [further from] you
                 v0, v1 = probe(x0_batch), probe(x1_batch)
 
                 # get the corresponding loss
@@ -386,7 +423,6 @@ class CCS:
 
                 # update the parameters
                 optimizer.zero_grad()
-                # TODO fix loss not being scalar at some point
                 loss.backward()
                 optimizer.step()
         return self.evaluate(probe, dataloader)
