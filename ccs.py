@@ -143,6 +143,8 @@ def get_ball_positions(observation_pairs, device, ball_color=236):
         ball_positions.append(ball_pos)
     return th.tensor(ball_positions, dtype=th.float).to(device)
 
+# TODO
+# def get_ball_directions()
 
 class ValueProbe(nn.Module):
     def __init__(self, dim):
