@@ -228,7 +228,7 @@ class ProbeMonitor:
 
     def save_video(
         self,
-        metrics_name,
+        metrics_names,
         video_path: Path,
         file_name=None,
         max_video_length=4000,
@@ -249,7 +249,7 @@ class ProbeMonitor:
         game_render, plots = self.init_plot(
             ax1,
             ax2,
-            metrics_name,
+            metrics_names,
             sliding_window,
             min(max_video_length, len(self.frames)),
         )
@@ -265,7 +265,8 @@ class ProbeMonitor:
             pbar.n = frame
             pbar.refresh()
             game_render.set_array(self.frames[frame])
-            for plot, values in zip(plots, self.metrics_values.values()):
+            for plot, metric in zip(plots, metrics_names):
+                values = self.metrics_values[metric]
                 plot.set_data(
                     list(range(max(0, frame - sliding_window), frame + 1)),
                     values[max(0, frame - sliding_window) : frame + 1],
