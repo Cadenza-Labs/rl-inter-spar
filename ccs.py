@@ -232,7 +232,7 @@ class CCS:
             # We evaluate the model on the environment to get the observation shape
             obs = preprocess(th.tensor(env.reset(), dtype=th.float, device=self.device))
             _, self.train_activations = nice_hooks.run(
-                self.model, obs, return_activations=True
+                self.module, obs, return_activations=True
             )
             self.train_activations = self.train_activations[self.layer_name].unsqueeze(
                 0
@@ -349,7 +349,6 @@ class CCS:
 
     def get_return_metrics(self):
         """Computes metrics of value probe against trajectory returns."""
-        num_trajs = len(self.test_activations)
         x0 = (
             self.test_activations[:, 0]
             .detach()
