@@ -151,7 +151,7 @@ class ValueProbe(nn.Module):
         self.linear = nn.Linear(dim, 1)
 
     def forward(self, x):
-        h = self.linear(x)
+        h = self.linear(x.flatten(start_dim=1))
         return th.tanh(h)
 
 
@@ -244,11 +244,12 @@ class CCS:
         activations_path = dataset_path.with_suffix("") / "activations.pt"
         returns_path = dataset_path.with_suffix("") / "returns.pt"
         ball_pos_path = dataset_path.with_suffix("") / "ball_pos.pt"
-        if activations_path.exists() and False:
+        if activations_path.exists():
             if verbose:
                 print(f"Found cached activations at: {activations_path}")
             activation_pairs = th.load(activations_path)
             return_pairs = th.load(returns_path)
+            ball_pos_pairs = th.load(ball_pos_path)
             if verbose:
                 print(f"loaded return pairs of shape {return_pairs.shape}")
                 print(f"loaded activation pairs of shape {activation_pairs.shape}")
@@ -292,7 +293,7 @@ class CCS:
         #)
 
     def initialize_probe(self):
-        dim = self.train_activations[0].shape[-1]
+        dim = self.train_activations[0][0].flatten().shape[0]
         return ValueProbe(dim).to(self.device)
 
     def normalize(self, activations):
