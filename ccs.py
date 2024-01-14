@@ -134,17 +134,24 @@ def get_hidden_activations_dataset(module, device, dataset):
     return hidden_act_dataset
 
 
-def get_ball_positions(observation_pairs, device, ball_color=236):
-    """Returns tensor of ball positions (0=left player, 1=right player)."""
-    half_width = observation_pairs[0].shape[1] // 2
-    ball_positions = []
+def is_ball_approaching(observation_pairs, device, ball_color=236):
+    """Returns tensor of whether ball is approaching.
+        True, False: ball approaching left player.
+        False, True: ball approaching right player.
+        False, False: ball not present/not moving.
+    """
+    ball_approaching = []
     for pair in observation_pairs:
-        ball_pos = (pair == ball_color).sum(axis=1).argmax(axis=1) >= half_width
-        ball_positions.append(ball_pos)
-    return th.tensor(ball_positions, dtype=th.float).to(device)
+        # pair (players, img_x, img_y, frames)
+        ball_indices = (pair == ball_color).sum(axis=1).argmax(axis=1)  # (players, frames)
+        # calculate index difference of where the ball is to get its direction
+        # assumption: first frame is before last frame in frame stack
+        ball_index_diff = ball_indices[:, 0] - ball_indices[:, -1]  # (players,)
+        # ball flying to left is equivalent to ball approaching each player in their own perspective
+        ball_approaching_player = ball_index_diff > 0
+        ball_approaching.append(ball_approaching_player)
+    return th.tensor(ball_approaching, dtype=th.float).to(device)
 
-# TODO
-# def get_ball_directions()
 
 class ValueProbe(nn.Module):
     def __init__(self, dim):
@@ -249,13 +256,13 @@ class CCS:
         # TODO: we could store the activations of each layer in different files
         activations_path = dataset_path.with_suffix("") / "activations.pt"
         returns_path = dataset_path.with_suffix("") / "returns.pt"
-        ball_pos_path = dataset_path.with_suffix("") / "ball_pos.pt"
+        ball_approaching_path = dataset_path.with_suffix("") / "ball_pos.pt"
         if activations_path.exists():
             if verbose:
                 print(f"Found cached activations at: {activations_path}")
             activation_pairs = th.load(activations_path)
             return_pairs = th.load(returns_path)
-            ball_pos_pairs = th.load(ball_pos_path)
+            ball_approaching_pairs = th.load(ball_approaching_path)
             if verbose:
                 print(f"loaded return pairs of shape {return_pairs.shape}")
                 print(f"loaded activation pairs of shape {activation_pairs.shape}")
@@ -266,11 +273,11 @@ class CCS:
             activation_pairs = get_hidden_activations_dataset(
                 module, device, observation_pairs
             )
-            ball_pos_pairs = get_ball_positions(observation_pairs, device)
+            ball_approaching_pairs = is_ball_approaching(observation_pairs, device)
             activations_path.parent.mkdir(parents=True, exist_ok=True)
             th.save(activation_pairs, activations_path)
             th.save(return_pairs, returns_path)
-            th.save(ball_pos_pairs, ball_pos_path)
+            th.save(ball_approaching_pairs, ball_approaching_path)
         activation_pairs = (
             th.cat(
                 [pair[layer_name].unsqueeze(0) for pair in activation_pairs],
@@ -279,26 +286,16 @@ class CCS:
             .detach()
             .to(self.device)
         )
-        # average over stacked frames
-        ball_pos_pairs = ball_pos_pairs.mean(axis=-1) > 0.5
-
-        activation_pairs = self.normalize_wrt_ball_position(activation_pairs, ball_pos_pairs)
+        activation_pairs = self.normalize_wrt_ball_approaching_no_player(activation_pairs, ball_approaching_pairs)
 
         # split data
         num_pairs = activation_pairs.shape[0]
         perm = th.randperm(num_pairs, generator=th.Generator().manual_seed(seed))
         permuted_activation_pairs = activation_pairs[perm]
-        # permuted_ball_pos_pairs = ball_pos_pairs[perm]
         permuted_return_pairs = return_pairs[perm]
         split_idx = int((1 - val_fraction) * num_pairs)
         self.train_activations, self.test_activations = permuted_activation_pairs[:split_idx], permuted_activation_pairs[split_idx:]
-        # self.train_ball_pos, self.test_ball_pos = permuted_ball_pos_pairs[:split_idx], permuted_ball_pos_pairs[split_idx:]
         self.train_returns, self.test_returns = permuted_return_pairs[:split_idx], permuted_return_pairs[split_idx:]
-        #self.train_activations, self.test_activations = data_th.random_split(
-        #    activation_pairs,
-        #    lengths=[val_fraction, 1 - val_fraction],
-        #    generator=th.Generator().manual_seed(seed),
-        #)
 
     def initialize_probe(self):
         dim = self.train_activations[0][0].flatten().shape[0]
@@ -315,12 +312,10 @@ class CCS:
 
         return normalized_x
 
-    def normalize_wrt_ball_position(self, activation_pairs, ball_pos_pairs):
+    def normalize_wrt_ball_approaching(self, activation_pairs, ball_pos_pairs):
         """
         Normalize activations with respect to the ball position for each player separately.
         """
-        # TODO: it might not be necessary to 
-        # normalize separately for each player; Probably create another method to test that.
         indices_player1_left = th.where(ball_pos_pairs[:, 0] == 0)[0]
         indices_player1_right = th.where(ball_pos_pairs[:, 0] == 1)[0]
         indices_player2_left = th.where(ball_pos_pairs[:, 1] == 0)[0]
@@ -337,8 +332,22 @@ class CCS:
         combined_activations_player1[indices_player1_right] = activations_player1_right
         combined_activations_player2[indices_player2_left] = activations_player2_left
         combined_activations_player2[indices_player2_right] = activations_player2_right
-
         return th.stack((combined_activations_player1, combined_activations_player2), dim=1)
+
+    def normalize_wrt_ball_approaching_no_player(self, activation_pairs, ball_approaching):
+        """
+        Normalize activations with respect to the ball position.
+        """
+        indices_approaching = th.where(ball_approaching == 1)
+        indices_not_approaching = th.where(ball_approaching == 0)
+        activations_approaching = self.normalize(activation_pairs[indices_approaching])
+        activations_not_approaching = self.normalize(activation_pairs[indices_not_approaching])
+
+        # Place the normalized activations back into the combined arrays
+        combined_activations = th.zeros_like(activation_pairs)
+        combined_activations[indices_approaching] = activations_approaching
+        combined_activations[indices_not_approaching] = activations_not_approaching
+        return combined_activations
 
     def get_loss(self, value_1, value_2):
         """Returns the CCS loss for two values each of shape (n,1) or (n,)."""
