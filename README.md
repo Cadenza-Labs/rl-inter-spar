@@ -3,6 +3,11 @@
 
 ## Installation
 
+### add nice_hooks by running
+```
+git submodule update --init --recursive
+```
+
 ### Create environment and install packages
 ```
 conda create -n spar python==3.10
