@@ -3,9 +3,15 @@
 
 ## Installation
 
-### add nice_hooks by running
+### submodules
 ```
 git submodule update --init --recursive
+```
+
+### AutoROM
+Run:
+```
+AutoROM --accept-license
 ```
 
 ### Create environment and install packages
@@ -20,7 +26,4 @@ AutoROM
 ### Playground
 `playground.py` needs a `ffmpeg` installation to save the video.
 
-## Install submodules
-```
-git submodule update --init --recursive
-```
+
