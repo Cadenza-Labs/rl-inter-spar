@@ -1,5 +1,6 @@
 from pathlib import Path
 import pickle
+from supervised import train_supervised
 import torch.nn as nn
 from torch.utils import data as data_th
 from torch.utils.data import DataLoader
@@ -669,7 +670,7 @@ if __name__ == "__main__":
     # Train multiple CCS probes on specified layer
     if args.layer_indicies == []:
         args.layer_indicies = range(
-            len(model.actor_network)
+            len(model.actor_network)    
         )  # actor and critic network have same number of layers
     if args.modules == []:
         args.modules = ["actor_network", "critic_network"]
@@ -703,7 +704,12 @@ if __name__ == "__main__":
         }
         probes_fn_dict.update(probe_dict)
         probes_fn_dict_list.append(probe_dict)
-
+        
+        print(f"\n\n====== Training Supervised probe for {layer_name} ======")
+        train_supervised(
+            data_save_path, 
+            layer=8
+        )
     metrics = {
         "Right player value": lambda obs: model.get_value(obs[:1]).item(),
         "Left player value": lambda obs: model.get_value(obs[1:2]).item(),
