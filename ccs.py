@@ -1,6 +1,6 @@
 from pathlib import Path
 import pickle
-from supervised import train_supervised
+from sklearn.linear_model import LogisticRegression
 import torch.nn as nn
 from torch.utils import data as data_th
 from torch.utils.data import DataLoader
@@ -12,6 +12,7 @@ import random
 import time
 from itertools import product
 import csv
+from einops import rearrange
 
 # from imitation.data.rollout import generate_trajectories, make_sample_until
 # from imitation.data.serialize import save, load_with_rewards
@@ -27,6 +28,10 @@ from probe_visualization import ProbeMonitor
 HF_PATH = Path("hf_models")
 DATASET_PATH = Path("datasets")
 
+WEIGHT_DECAY=0.01
+VAL_FRACTION=0.2
+GAMMA=0.99
+SEED=42
 
 @dataclass
 class Trajectory:
@@ -194,6 +199,136 @@ def calculate_returns(reward_pairs, gamma=0.99):
     return th.tensor(return_pairs)
 
 
+def normalize(self, activations):
+    """
+    Mean-normalizes the data x (of shape (n, d))
+    If self.var_normalize, also divides by the standard deviation
+    """
+    normalized_x = activations - activations.mean(axis=0, keepdims=True)
+    if self.var_normalize:
+        normalized_x /= normalized_x.std(axis=0, keepdims=True)
+
+    return normalized_x
+
+def normalize_wrt_ball_approaching_no_player( activation_pairs, ball_approaching):
+        """
+        Normalize activations with respect to the ball position.
+        """
+        indices_approaching = th.where(ball_approaching == 1)
+        indices_not_approaching = th.where(ball_approaching == 0)
+        activations_approaching = normalize(activation_pairs[indices_approaching])
+        activations_not_approaching = normalize(activation_pairs[indices_not_approaching])
+
+        # Place the normalized activations back into the combined arrays
+        combined_activations = th.zeros_like(activation_pairs)
+        combined_activations[indices_approaching] = activations_approaching
+        combined_activations[indices_not_approaching] = activations_not_approaching
+        return combined_activations
+
+def normalize_wrt_ball_approaching(activation_pairs, ball_pos_pairs):
+    """
+    Normalize activations with respect to the ball position for each player separately.
+    """
+    indices_player1_left = th.where(ball_pos_pairs[:, 0] == 0)[0]
+    indices_player1_right = th.where(ball_pos_pairs[:, 0] == 1)[0]
+    indices_player2_left = th.where(ball_pos_pairs[:, 1] == 0)[0]
+    indices_player2_right = th.where(ball_pos_pairs[:, 1] == 1)[0]
+    activations_player1_left = normalize(activation_pairs[:, 0][indices_player1_left])
+    activations_player1_right = normalize(activation_pairs[:, 0][indices_player1_right])
+    activations_player2_left = normalize(activation_pairs[:, 1][indices_player2_left])
+    activations_player2_right = normalize(activation_pairs[:, 1][indices_player2_right])
+
+    # Place the normalized activations back into the combined arrays
+    combined_activations_player1 = th.zeros_like(activation_pairs[:, 0])
+    combined_activations_player2 = th.zeros_like(activation_pairs[:, 1])
+    combined_activations_player1[indices_player1_left] = activations_player1_left
+    combined_activations_player1[indices_player1_right] = activations_player1_right
+    combined_activations_player2[indices_player2_left] = activations_player2_left
+    combined_activations_player2[indices_player2_right] = activations_player2_right
+    return th.stack((combined_activations_player1, combined_activations_player2), dim=1)
+
+
+
+def extract(module, layer_name, dataset_path, verbose, device, val_fraction, gamma, seed, normalize=True):
+        if verbose:
+            print("get hidden activations")
+        # TODO: we could store the activations of each layer in different files
+        activations_path = dataset_path.with_suffix("") / "activations.pt"
+        returns_path = dataset_path.with_suffix("") / "returns.pt"
+        ball_approaching_path = dataset_path.with_suffix("") / "ball_pos.pt"
+        if activations_path.exists():
+            if verbose:
+                print(f"Found cached activations at: {activations_path}")
+            activation_pairs = th.load(activations_path)
+            return_pairs = th.load(returns_path)
+            ball_approaching_pairs = th.load(ball_approaching_path)
+            if verbose:
+                print(f"loaded return pairs of shape {return_pairs.shape}")
+                print(f"loaded activation pairs of shape {activation_pairs.shape}")
+        else:
+            if verbose:
+                print(f"No cached activations. Computing them...")
+            observation_pairs, return_pairs = load_data(dataset_path, gamma)
+            activation_pairs = get_hidden_activations_dataset(
+                module, device, observation_pairs
+            )
+            ball_approaching_pairs = is_ball_approaching(observation_pairs, device)
+            activations_path.parent.mkdir(parents=True, exist_ok=True)
+            th.save(activation_pairs, activations_path)
+            th.save(return_pairs, returns_path)
+            th.save(ball_approaching_pairs, ball_approaching_path)
+        activation_pairs = (
+            th.cat(
+                [pair[layer_name].unsqueeze(0) for pair in activation_pairs],
+                axis=0,
+            )
+            .detach()
+            .to(device)
+        )
+        
+        if normalize:
+            activation_pairs = normalize_wrt_ball_approaching_no_player(activation_pairs, ball_approaching_pairs)
+
+        # split data
+        num_pairs = activation_pairs.shape[0]
+        perm = th.randperm(num_pairs, generator=th.Generator().manual_seed(seed))
+        permuted_activation_pairs = activation_pairs[perm]
+        permuted_return_pairs = return_pairs[perm]
+        split_idx = int((1 - val_fraction) * num_pairs)
+        train_activations, test_activations = permuted_activation_pairs[:split_idx], permuted_activation_pairs[split_idx:]
+        train_returns, test_returns = permuted_return_pairs[:split_idx], permuted_return_pairs[split_idx:]
+
+        return train_activations, test_activations, train_returns, test_returns
+
+
+def train_supervised(dataset_path, module, layer_name, verbose, device, val_fraction, gamma, seed):
+    """Linear classifier trained with supervised learning."""
+    
+    train_activations, test_activations, train_returns, test_returns = extract(
+        module, 
+        layer_name, 
+        dataset_path, 
+        verbose, 
+        device, 
+        val_fraction, 
+        gamma, 
+        seed,
+        normalize=False 
+    )
+    
+    x_train = rearrange(train_activations, 'n p d -> (n p) d')
+    x_test = rearrange(test_activations, 'n p d -> (n p) d')
+    
+    # TODO: What to actually use as labels?
+    y_train = rearrange(train_returns, 'n p -> (n p)')
+    y_test = rearrange(test_returns, 'n p -> (n p)')
+    
+    lr = LogisticRegression(class_weight="balanced")
+    lr.fit(x_train.cpu(), y_train.cpu())
+    print("Logistic regression accuracy: {}".format(lr.score(x_test, y_test)))
+
+
+
 class CCS:
     """Implementation of contrast consistent search for value functions."""
 
@@ -209,11 +344,11 @@ class CCS:
         batch_size=-1,
         verbose=False,
         device="cuda",
-        weight_decay=0.01,
+        weight_decay=WEIGHT_DECAY,
         var_normalize=False,
-        val_fraction=0.2,
-        gamma=0.99,
-        seed=42,
+        val_fraction=VAL_FRACTION,
+        gamma=GAMMA,
+        seed=SEED,
         load=True,
     ):
         self.env = env
@@ -251,104 +386,25 @@ class CCS:
             self.train_activations = None
             return
 
-        if verbose:
-            print("get hidden activations")
-        # TODO: load outside to avoid dupicate
-        # TODO: we could store the activations of each layer in different files
-        activations_path = dataset_path.with_suffix("") / "activations.pt"
-        returns_path = dataset_path.with_suffix("") / "returns.pt"
-        ball_approaching_path = dataset_path.with_suffix("") / "ball_pos.pt"
-        if activations_path.exists():
-            if verbose:
-                print(f"Found cached activations at: {activations_path}")
-            activation_pairs = th.load(activations_path)
-            return_pairs = th.load(returns_path)
-            ball_approaching_pairs = th.load(ball_approaching_path)
-            if verbose:
-                print(f"loaded return pairs of shape {return_pairs.shape}")
-                print(f"loaded activation pairs of shape {activation_pairs.shape}")
-        else:
-            if verbose:
-                print(f"No cached activations. Computing them...")
-            observation_pairs, return_pairs = load_data(dataset_path, gamma)
-            activation_pairs = get_hidden_activations_dataset(
-                module, device, observation_pairs
-            )
-            ball_approaching_pairs = is_ball_approaching(observation_pairs, device)
-            activations_path.parent.mkdir(parents=True, exist_ok=True)
-            th.save(activation_pairs, activations_path)
-            th.save(return_pairs, returns_path)
-            th.save(ball_approaching_pairs, ball_approaching_path)
-        activation_pairs = (
-            th.cat(
-                [pair[layer_name].unsqueeze(0) for pair in activation_pairs],
-                axis=0,
-            )
-            .detach()
-            .to(self.device)
+        self.train_activations, \
+        self.test_activations, \
+        self.train_returns, \
+        self.test_returns =  extract(
+            module, 
+            layer_name, 
+            dataset_path, 
+            verbose, 
+            device, 
+            val_fraction, 
+            gamma, 
+            seed,
+            normalize=False 
         )
-        activation_pairs = self.normalize_wrt_ball_approaching_no_player(activation_pairs, ball_approaching_pairs)
 
-        # split data
-        num_pairs = activation_pairs.shape[0]
-        perm = th.randperm(num_pairs, generator=th.Generator().manual_seed(seed))
-        permuted_activation_pairs = activation_pairs[perm]
-        permuted_return_pairs = return_pairs[perm]
-        split_idx = int((1 - val_fraction) * num_pairs)
-        self.train_activations, self.test_activations = permuted_activation_pairs[:split_idx], permuted_activation_pairs[split_idx:]
-        self.train_returns, self.test_returns = permuted_return_pairs[:split_idx], permuted_return_pairs[split_idx:]
-
+    
     def initialize_probe(self):
         dim = self.train_activations[0][0].flatten().shape[0]
         return ValueProbe(dim).to(self.device)
-
-    def normalize(self, activations):
-        """
-        Mean-normalizes the data x (of shape (n, d))
-        If self.var_normalize, also divides by the standard deviation
-        """
-        normalized_x = activations - activations.mean(axis=0, keepdims=True)
-        if self.var_normalize:
-            normalized_x /= normalized_x.std(axis=0, keepdims=True)
-
-        return normalized_x
-
-    def normalize_wrt_ball_approaching(self, activation_pairs, ball_pos_pairs):
-        """
-        Normalize activations with respect to the ball position for each player separately.
-        """
-        indices_player1_left = th.where(ball_pos_pairs[:, 0] == 0)[0]
-        indices_player1_right = th.where(ball_pos_pairs[:, 0] == 1)[0]
-        indices_player2_left = th.where(ball_pos_pairs[:, 1] == 0)[0]
-        indices_player2_right = th.where(ball_pos_pairs[:, 1] == 1)[0]
-        activations_player1_left = self.normalize(activation_pairs[:, 0][indices_player1_left])
-        activations_player1_right = self.normalize(activation_pairs[:, 0][indices_player1_right])
-        activations_player2_left = self.normalize(activation_pairs[:, 1][indices_player2_left])
-        activations_player2_right = self.normalize(activation_pairs[:, 1][indices_player2_right])
-
-        # Place the normalized activations back into the combined arrays
-        combined_activations_player1 = th.zeros_like(activation_pairs[:, 0])
-        combined_activations_player2 = th.zeros_like(activation_pairs[:, 1])
-        combined_activations_player1[indices_player1_left] = activations_player1_left
-        combined_activations_player1[indices_player1_right] = activations_player1_right
-        combined_activations_player2[indices_player2_left] = activations_player2_left
-        combined_activations_player2[indices_player2_right] = activations_player2_right
-        return th.stack((combined_activations_player1, combined_activations_player2), dim=1)
-
-    def normalize_wrt_ball_approaching_no_player(self, activation_pairs, ball_approaching):
-        """
-        Normalize activations with respect to the ball position.
-        """
-        indices_approaching = th.where(ball_approaching == 1)
-        indices_not_approaching = th.where(ball_approaching == 0)
-        activations_approaching = self.normalize(activation_pairs[indices_approaching])
-        activations_not_approaching = self.normalize(activation_pairs[indices_not_approaching])
-
-        # Place the normalized activations back into the combined arrays
-        combined_activations = th.zeros_like(activation_pairs)
-        combined_activations[indices_approaching] = activations_approaching
-        combined_activations[indices_not_approaching] = activations_not_approaching
-        return combined_activations
 
     def get_loss(self, value_1, value_2):
         """Returns the CCS loss for two values each of shape (n,1) or (n,)."""
@@ -689,7 +745,7 @@ if __name__ == "__main__":
             device=args.device,
             num_tries=args.best_of_n,
             load=args.load_best_probe,
-            # verbose=True,
+            verbose=False
         )
         if ccs.best_probe is None:
             ccs.repeated_train(save=args.save_probe)
@@ -707,9 +763,16 @@ if __name__ == "__main__":
         
         print(f"\n\n====== Training Supervised probe for {layer_name} ======")
         train_supervised(
-            data_save_path, 
-            layer=8
+            dataset_path=data_save_path,
+            module=model,
+            layer_name=layer_name,
+            verbose=False,
+            device=args.device,
+            val_fraction=WEIGHT_DECAY,
+            gamma=GAMMA,
+            seed=SEED
         )
+            
     metrics = {
         "Right player value": lambda obs: model.get_value(obs[:1]).item(),
         "Left player value": lambda obs: model.get_value(obs[1:2]).item(),
