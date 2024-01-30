@@ -11,7 +11,6 @@ from pathlib import Path
 
 
 class FrameSelector:
-
     def __init__(self, num_frames):
         self.num_frames = num_frames
         self.frame = 0
@@ -54,6 +53,7 @@ class ProbeMonitor:
         frames = []
         num_rounds = 0
         start_time = time.time()
+        reward_list = []
         while True:
             actions = np.zeros(len(obs), dtype=np.int64)
             action1 = player1.get_action(obs[::2])
@@ -65,6 +65,7 @@ class ProbeMonitor:
             obs, rewards, dones, _ = self.envs.step(actions)
             frame = obs[0, :, :, 0]
             frames.append(np.stack([frame, frame, frame], axis=2))
+            reward_list.append(rewards[0] != 0)
             obs = th.Tensor(obs).to(self.device)
             num_rounds += np.logical_or(rewards > 0, dones).sum().item()
             total_length += obs.shape[0] // 2
@@ -84,6 +85,7 @@ class ProbeMonitor:
                 else:
                     print("No rounds finished")
                 self.frames = np.stack(frames, dtype=np.uint8)
+                self.rewards = reward_list
                 return
 
     def init_plot(self, ax1, ax2, metrics_name, sliding_window, total_frames):
@@ -117,6 +119,11 @@ class ProbeMonitor:
             ymin = min(ymin, min(values) - 0.05)
             ymax = max(ymax, max(values) + 0.05)
             plots.append(plot)
+        # Plot a vertical line for each x when reward != 0
+        for i, reward in enumerate(self.rewards):
+            if reward != 0:
+                ax2.axvline(x=i, color="black", linestyle="--", alpha=0.5, linewidth=0.5)
+        ax2.set_xlim(0, sliding_window)
         ax2.set_ylim(ymin, ymax)
         ax2.set_xlabel("Time")
         ax2.set_ylabel("Value")
