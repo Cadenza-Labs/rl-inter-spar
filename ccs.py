@@ -10,6 +10,7 @@ import random
 import time
 from itertools import product
 import csv
+from warnings import warn
 
 # from imitation.data.rollout import generate_trajectories, make_sample_until
 # from imitation.data.serialize import save, load_with_rewards
@@ -85,23 +86,17 @@ def generate_dataset(env, model_path, num_episodes, max_episode_length, seed, de
         get_action, num_episodes * max_episode_length
     )
     random.Random(seed).shuffle(trajectories)
-    # trajectories = generate_trajectories(
-    #    model,
-    #    env,
-    #    make_sample_until(min_episodes=num_episodes),
-    #    np.random.default_rng(seed),
-    # )
     return trajectories
 
 
-def load_data(dataset_path):
+def load_trajectories(dataset_path):
     """Load trajectories"""
     with open(dataset_path, "rb") as file:
         dataset = pickle.load(file)
     observation_pairs = sum([traj.obs for traj in dataset], [])
     reward_pairs = sum([traj.rewards for traj in dataset], [])
     return_pairs = th.cat([calculate_returns(traj.rewards) for traj in dataset], dim=0)
-    return observation_pairs, return_pairs
+    return observation_pairs, return_pairs, reward_pairs
 
 
 def load_model(model_path, env, device):
@@ -138,10 +133,27 @@ class ValueProbe(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.linear = nn.Linear(dim, 1)
+        self.sign = 1
 
     def forward(self, x):
         h = self.linear(x.flatten(start_dim=1))
-        return th.tanh(h)
+        return th.tanh(h) * self.sign
+
+    @th.no_grad()
+    def calibrate(self, hidden_activations, rewards):
+        """Calibrate the probe
+        Args:
+            hidden_activations: hidden activations of shape (n, d)
+            rewards: rewards of shape (n, 1)
+        """
+        # Compute the loss for forward and -forward and choose the sign that minimizes the loss
+        loss = nn.MSELoss()
+        positive_loss = loss(self.forward(hidden_activations), rewards)
+        negative_loss = loss(-self.forward(hidden_activations), rewards)
+        if positive_loss < negative_loss:
+            self.sign = 1
+        else:
+            self.sign = -1
 
 
 def discount_cumsum(x, discount):
@@ -241,24 +253,39 @@ class CCS:
         # TODO: we could store the activations of each layer in different files
         activations_path = dataset_path.with_suffix("") / "activations.pt"
         returns_path = dataset_path.with_suffix("") / "returns.pt"
-        if activations_path.exists():
+        rewards_path = dataset_path.with_suffix("") / "rewards.pt"
+        if (
+            activations_path.exists()
+            and returns_path.exists()
+            and rewards_path.exists()
+        ):
             if verbose:
                 print(f"Found cached activations at: {activations_path}")
             activation_pairs = th.load(activations_path)
             return_pairs = th.load(returns_path)
+            reward_pairs = th.load(rewards_path)
             if verbose:
                 print(f"loaded return pairs of shape {return_pairs.shape}")
+                print(f"loaded reward pairs of shape {reward_pairs.shape}")
                 print(f"loaded activation pairs of shape {activation_pairs.shape}")
         else:
             if verbose:
                 print(f"No cached activations. Computing them...")
-            observation_pairs, return_pairs = load_data(dataset_path)
-            activation_pairs = get_hidden_activations_dataset(
-                model, device, observation_pairs
+            observation_pairs, return_pairs, reward_pairs = load_trajectories(
+                dataset_path
             )
             activations_path.parent.mkdir(parents=True, exist_ok=True)
-            th.save(activation_pairs, activations_path)
-            th.save(return_pairs, returns_path)
+            if not activations_path.exists():
+                activation_pairs = get_hidden_activations_dataset(
+                    model, device, observation_pairs
+                )
+            else:
+                activation_pairs = th.load(activations_path)
+                th.save(activation_pairs, activations_path)
+            if not returns_path.exists():
+                th.save(return_pairs, returns_path)
+            if not rewards_path.exists():
+                th.save(reward_pairs, rewards_path)
         activation_pairs = (
             th.cat(
                 [pair[layer_name].unsqueeze(0) for pair in activation_pairs],
@@ -271,6 +298,16 @@ class CCS:
         # in eval function
         self.train_activations, self.test_activations = data_th.random_split(
             activation_pairs,
+            lengths=[val_fraction, 1 - val_fraction],
+            generator=th.Generator().manual_seed(seed),
+        )
+        self.train_returns, self.test_returns = data_th.random_split(
+            return_pairs,
+            lengths=[val_fraction, 1 - val_fraction],
+            generator=th.Generator().manual_seed(seed),
+        )
+        self.train_rewards, self.test_rewards = data_th.random_split(
+            reward_pairs,
             lengths=[val_fraction, 1 - val_fraction],
             generator=th.Generator().manual_seed(seed),
         )
@@ -390,6 +427,18 @@ class CCS:
         obs = preprocess(obs)
         _, activations = nice_hooks.run(self.model, obs, return_activations=True)
         return self.best_probe(activations[self.layer_name])
+
+    @th.no_grad()
+    def calibrate(self):
+        """
+        Calibrate the best probe
+        """
+        if (self.train_rewards == 0).all():
+            warn(
+                "All rewards are zero. The probe will not be calibrated. Consider using a different dataset."
+            )
+            return
+        self.best_probe.calibrate(self.train_activations, self.train_rewards)
 
     def train(self, probe):
         """Train a single probe on its layer."""
@@ -696,6 +745,7 @@ if __name__ == "__main__":
             )
             if ccs.best_probe is None:
                 ccs.repeated_train(save=args.save_probe)
+            ccs.calibrate()
             probes.append(ccs)
             inf_loss_string = f"with inf loss weight {inf_loss_weight :.2g}"
             probe_dict = {
@@ -707,7 +757,9 @@ if __name__ == "__main__":
                 ).item(),
             }
             probes_fn_dict.update(probe_dict)
-            fn_grouped_by_probe[f"{layer_name}_inf_loss_weight_{inf_loss_weight: g}"] = probe_dict
+            fn_grouped_by_probe[
+                f"{layer_name}_inf_loss_weight_{inf_loss_weight: g}"
+            ] = probe_dict
 
     metrics = {
         "Right player value": lambda obs: model.get_value(obs[:1]).item(),
@@ -759,7 +811,8 @@ if __name__ == "__main__":
                 monitor.save_video(
                     list(probe_fn_dict.keys()) + extra_metrics,
                     video_path / probe_name,
-                    file_name=f"ccs_eval_{int(time.time())}" + ("_pv" if args.record_agent_value else ""),
+                    file_name=f"ccs_eval_{int(time.time())}"
+                    + ("_pv" if args.record_agent_value else ""),
                     sliding_window=args.sliding_window,
                     max_video_length=args.max_video_length,
                 )
