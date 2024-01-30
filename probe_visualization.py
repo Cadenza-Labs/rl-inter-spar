@@ -6,11 +6,11 @@ import torch as th
 import numpy as np
 import matplotlib.style as mplstyle
 from matplotlib.widgets import Slider, Button, CheckButtons
+from matplotlib.ticker import AutoLocator
 from pathlib import Path
 
 
 class FrameSelector:
-    """"""
 
     def __init__(self, num_frames):
         self.num_frames = num_frames
@@ -114,8 +114,8 @@ class ProbeMonitor:
                 label=name,
                 alpha=0.5,
             )
-            ymin = min(ymin, min(values))
-            ymax = max(ymax, max(values))
+            ymin = min(ymin, min(values) - 0.05)
+            ymax = max(ymax, max(values) + 0.05)
             plots.append(plot)
         ax2.set_ylim(ymin, ymax)
         ax2.set_xlabel("Time")
@@ -245,7 +245,9 @@ class ProbeMonitor:
             max_video_length: the maximum number of frames to save
             sliding_window: the size of the sliding window to plot
         """
-        fig, (ax1, ax2, lax) = plt.subplots(1, 3, figsize=(12, 6), layout="constrained")
+        fig, (ax1, ax2, lax) = plt.subplots(
+            1, 3, figsize=(19, 10), layout="constrained"
+        )
         game_render, plots = self.init_plot(
             ax1,
             ax2,
@@ -271,8 +273,24 @@ class ProbeMonitor:
                     list(range(max(0, frame - sliding_window), frame + 1)),
                     values[max(0, frame - sliding_window) : frame + 1],
                 )
+            # Some magic to make the x axis of the plot look good
+            ax2.xaxis.set_major_locator(AutoLocator())
             if frame > sliding_window:
                 ax2.set_xlim(frame - sliding_window, frame)
+                ax2.xaxis.set_major_locator(AutoLocator())
+            xinf, xlim = ax2.get_xlim()
+            xticks = ax2.get_xticks()
+            if xticks[-1] > xlim:
+                xticks[-2] = xlim
+                xticks = xticks[:-1]
+            elif xticks[-1] < xlim:
+                xticks[-1] = xlim
+            if xticks[0] < xinf:
+                xticks[1] = xinf
+                xticks = xticks[1:]
+            elif xticks[0] > xinf:
+                xticks[0] = xinf
+            ax2.set_xticks(xticks)
             return [game_render] + plots
 
         # Create the animation
@@ -280,11 +298,9 @@ class ProbeMonitor:
             fig, update, frames=min(max_video_length, len(self.frames)), blit=True
         )
 
-        # Save value plot as a png
         video_path.mkdir(parents=True, exist_ok=True)
-        fig.tight_layout()
         f_name = file_name or f"{self.agent1.name}_vs_{self.agent2.name}"
         pbar.set_description("Generating video")
         animation.save(str(video_path / f"{f_name}.mp4"), fps=30)
-        print("Saved video to " + str(video_path / f"{f_name}.mp4"))
         pbar.close()
+        print("Saved video to " + str(video_path / f"{f_name}.mp4"))
