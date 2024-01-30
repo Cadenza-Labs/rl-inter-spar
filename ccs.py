@@ -4,7 +4,6 @@ import torch.nn as nn
 from torch.utils import data as data_th
 from torch.utils.data import DataLoader
 import torch as th
-import copy
 import numpy as np
 import scipy
 import random
@@ -187,6 +186,7 @@ class CCS:
         num_epochs=1000,
         num_tries=10,
         learning_rate=1e-3,
+        informative_loss_weight=1.0,
         batch_size=-1,
         verbose=False,
         device="cuda",
@@ -196,7 +196,6 @@ class CCS:
         seed=42,
         load=True,
     ):
-        # TODO: refactor so that CCS has a self.layer_name and only handle this layer
         self.env = env
         self.model = model
         self.layer_name = layer_name
@@ -205,6 +204,7 @@ class CCS:
         self.num_epochs = num_epochs
         self.num_tries = num_tries
         self.learning_rate = learning_rate
+        self.informative_loss_weight = informative_loss_weight
         self.verbose = verbose
         self.device = device
         self.batch_size = batch_size
@@ -213,7 +213,11 @@ class CCS:
         self.seed = seed
         self.dataset_path = dataset_path.with_suffix("")
         self.best_probe = None
-        self.probe_path = self.dataset_path / "probes" / f"{self.layer_name}.pt"
+        self.probe_path = (
+            self.dataset_path
+            / "probes"
+            / f"{self.layer_name}_s{seed}_nt{num_tries}_ne{num_epochs}_wd{weight_decay}_inflossw{inf_loss_weight : g}.pt"
+        )
 
         if load and self.probe_path.exists():
             print(f"Loading probe from {self.probe_path}")
@@ -291,7 +295,7 @@ class CCS:
         # TODO add more loss options
         informative_loss = ((1 - value_1.abs()) ** 2 + (1 - value_2.abs()) ** 2).mean(0)
         consistent_loss = ((value_1 + value_2) ** 2).mean(0)
-        return consistent_loss + informative_loss
+        return consistent_loss + informative_loss * self.informative_loss_weight
 
     def get_return_metrics(self, probe):
         raise NotImplementedError("TODO: Return metric needs to be adapted")
@@ -435,7 +439,7 @@ class CCS:
             )
             if train_loss < best_loss:
                 print(f"New best loss!")
-                self.best_probe = copy.deepcopy(probe)
+                self.best_probe = probe
                 best_loss = train_loss
                 test_loss_best = test_loss
         if save:
@@ -448,16 +452,17 @@ class CCS:
                 writer.writerow(
                     [
                         "layer_name",
+                        "train_loss",
+                        "test_loss",
                         "num_epochs",
                         "num_tries",
                         "learning_rate",
+                        "informative_loss_weight",
                         "batch_size",
                         "weight_decay",
                         "val_fraction",
                         "seed",
                         "var_normalize",
-                        "train_loss",
-                        "test_loss",
                     ]
                 )
                 writer.writerow(
@@ -468,6 +473,7 @@ class CCS:
                         self.num_epochs,
                         self.num_tries,
                         self.learning_rate,
+                        self.informative_loss_weight,
                         self.batch_size,
                         self.weight_decay,
                         self.val_fraction,
@@ -512,6 +518,7 @@ def parse_args():
         const=True,
         default=False,
     )
+
     ccs_group = parser.add_argument_group("CCS")
     ccs_group.add_argument(
         "--modules",
@@ -533,6 +540,13 @@ def parse_args():
         default=10,
     )
     ccs_group.add_argument(
+        "--informative-loss-weights",
+        help="The weights of the informative loss",
+        type=float,
+        nargs="*",
+        default=[1.0],
+    )
+    ccs_group.add_argument(
         "--load-best-probe",
         help="Whether to load the best probe from the dataset if it exists",
         type=lambda x: bool(strtobool(x)),
@@ -548,6 +562,7 @@ def parse_args():
         const=True,
         default=True,
     )
+
     vis_group = parser.add_argument_group(
         "Visualization", "Parameters for the probe visualization across time"
     )
@@ -658,32 +673,41 @@ if __name__ == "__main__":
     layer_names = [f"{m}.{l}" for m, l in layers]
     probes = []
     probes_fn_dict = {}
-    probes_fn_dict_list = []
-    for layer_name in layer_names:
-        print(f"\n\n====== Training CCS probe for {layer_name} ======")
-        ccs = CCS(
-            env,
-            model,
-            layer_name,
-            data_save_path,
-            device=args.device,
-            num_tries=args.best_of_n,
-            load=args.load_best_probe,
-            # verbose=True,
-        )
-        if ccs.best_probe is None:
-            ccs.repeated_train(save=args.save_probe)
-        probes.append(ccs)
-        probe_dict = {
-            f"Right player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
-                obs[:1]
-            ).item(),
-            f"Left player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
-                obs[1:2]
-            ).item(),
-        }
-        probes_fn_dict.update(probe_dict)
-        probes_fn_dict_list.append(probe_dict)
+    fn_grouped_by_probe = {}
+    for inf_loss_weight in args.informative_loss_weights:
+        for layer_name in layer_names:
+            print(
+                "\n\n"
+                "===================================\n"
+                f"Training CCS probe for {layer_name}\n"
+                f"informative loss = {inf_loss_weight}\n"
+                "==================================="
+            )
+            ccs = CCS(
+                env,
+                model,
+                layer_name,
+                data_save_path,
+                informative_loss_weight=inf_loss_weight,
+                device=args.device,
+                num_tries=args.best_of_n,
+                load=args.load_best_probe,
+                # verbose=True,
+            )
+            if ccs.best_probe is None:
+                ccs.repeated_train(save=args.save_probe)
+            probes.append(ccs)
+            inf_loss_string = f"with inf loss weight {inf_loss_weight :.2g}"
+            probe_dict = {
+                f"Right player CCS probe on {layer_name} {inf_loss_string}": lambda obs, ccs=ccs: ccs.elicit(
+                    obs[:1]
+                ).item(),
+                f"Left player CCS probe on {layer_name} {inf_loss_string}": lambda obs, ccs=ccs: ccs.elicit(
+                    obs[1:2]
+                ).item(),
+            }
+            probes_fn_dict.update(probe_dict)
+            fn_grouped_by_probe[f"{layer_name}_inf_loss_weight_{inf_loss_weight: g}"] = probe_dict
 
     metrics = {
         "Right player value": lambda obs: model.get_value(obs[:1]).item(),
@@ -704,32 +728,40 @@ if __name__ == "__main__":
             metrics,
             args.device,
         )
+        print("\nMonitoring probe...")
         monitor.run(
             args.rounds_to_record,
             args.max_num_steps,
         )
         if args.interactive:
+            print("Starting interactive visualization...")
             monitor.interactive_visualization(args.sliding_window)
+            print("Interactive visualization finished.")
         if args.record_video_with_all_probes:
+            print("Recording video with all probes...")
             monitor.save_video(
                 metrics.keys(),
                 video_path / "_".join(f"{m}.{l}" for m, l in layers),
                 file_name=f"ccs_eval_{int(time.time())}",
                 sliding_window=args.sliding_window,
+                max_video_length=args.max_video_length,
             )
         if args.record_probe_videos:
+            print("Recording a video for each probe...")
             # Create a video for each probe
             # Notes: A lot of computation is duplicated here. We could avoid this by refactoring playground
-            for probe_dict, layer_name in zip(probes_fn_dict_list, layer_names):
+            for probe_name, probe_fn_dict in fn_grouped_by_probe.items():
                 extra_metrics = (
                     ["Right player value", "Left player value"]
                     if args.record_agent_value
                     else []
                 )
                 monitor.save_video(
-                    list(probe_dict.keys()) + extra_metrics,
-                    video_path / layer_name,
-                    file_name=f"ccs_eval_{int(time.time())}",
+                    list(probe_fn_dict.keys()) + extra_metrics,
+                    video_path / probe_name,
+                    file_name=f"ccs_eval_{int(time.time())}" + ("_pv" if args.record_agent_value else ""),
+                    sliding_window=args.sliding_window,
+                    max_video_length=args.max_video_length,
                 )
 
     # Evaluate probe against trajectory returns
