@@ -1,6 +1,6 @@
 from pathlib import Path
 import pickle
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LinearRegression
 import torch.nn as nn
 from torch.utils import data as data_th
 from torch.utils.data import DataLoader
@@ -31,7 +31,7 @@ DATASET_PATH = Path("datasets")
 WEIGHT_DECAY=0.01
 VAL_FRACTION=0.2
 GAMMA=0.99
-SEED=42
+SEED=44
 
 @dataclass
 class Trajectory:
@@ -301,6 +301,17 @@ def extract(module, layer_name, dataset_path, verbose, device, val_fraction, gam
         return train_activations, test_activations, train_returns, test_returns
 
 
+def supervised_prediction(lr, obs, module):
+    """ Predict the value of an observation using a supervised model. """
+    
+    obs = preprocess(obs)
+    _, activations = nice_hooks.run(module, obs, return_activations=True)
+    # activations = rearrange(activations, 'n p d -> (n p) d')
+    return lr.predict(activations)
+    
+    
+    
+
 def train_supervised(dataset_path, module, layer_name, verbose, device, val_fraction, gamma, seed):
     """Linear classifier trained with supervised learning."""
     
@@ -315,6 +326,8 @@ def train_supervised(dataset_path, module, layer_name, verbose, device, val_frac
         seed,
         normalize=False 
     )
+    # print("test_activations", test_activations.shape)
+    # print("test_returns", test_returns.shape)
     
     x_train = rearrange(train_activations, 'n p d -> (n p) d')
     x_test = rearrange(test_activations, 'n p d -> (n p) d')
@@ -323,9 +336,13 @@ def train_supervised(dataset_path, module, layer_name, verbose, device, val_frac
     y_train = rearrange(train_returns, 'n p -> (n p)')
     y_test = rearrange(test_returns, 'n p -> (n p)')
     
-    lr = LogisticRegression(class_weight="balanced")
+    
+    lr = LinearRegression()
     lr.fit(x_train.cpu(), y_train.cpu())
-    print("Logistic regression accuracy: {}".format(lr.score(x_test, y_test)))
+    # print("Linear regression accuracy (test): {}".format(lr.score(x_test.cpu(), y_test.cpu())))
+    # print("Linear regression accuracy (train): {}".format(lr.score(x_train.cpu(), y_train.cpu())))
+    
+    return lr
 
 
 
@@ -686,6 +703,48 @@ def parse_args():
     return parser.parse_args()
 
 
+def monitor_probes(args, env, agent1, agent2, layers, layer_names, probes_fn_dict_list, metrics, video_path):
+    if (
+        args.interactive
+        or args.record_probe_videos
+        or args.record_video_with_all_probes
+    ):
+        monitor = ProbeMonitor(
+            env,
+            agent1,
+            agent2,
+            metrics,
+            args.device,
+        )
+        monitor.run(
+            args.rounds_to_record,
+            args.max_num_steps,
+        )
+        if args.interactive:
+            monitor.interactive_visualization(args.sliding_window)
+        if args.record_video_with_all_probes:
+            monitor.save_video(
+                metrics.keys(),
+                video_path / "_".join(f"{m}.{l}" for m, l in layers),
+                file_name=f"ccs_eval_{int(time.time())}",
+                sliding_window=args.sliding_window,
+            )
+        if args.record_probe_videos:
+            # Create a video for each probe
+            # Notes: A lot of computation is duplicated here. We could avoid this by refactoring playground
+            for probe_dict, layer_name in zip(probes_fn_dict_list, layer_names):
+                extra_metrics = (
+                    ["Right player value", "Left player value"]
+                    if args.record_agent_value
+                    else []
+                )
+                monitor.save_video(
+                    list(probe_dict.keys()) + extra_metrics,
+                    video_path / layer_name,
+                    file_name=f"ccs_eval_{int(time.time())}",
+                )
+                print("Saved videos to", video_path / layer_name)
+
 if __name__ == "__main__":
     args = parse_args()
     # TODO? support multiple envs
@@ -750,19 +809,10 @@ if __name__ == "__main__":
         if ccs.best_probe is None:
             ccs.repeated_train(save=args.save_probe)
         probes.append(ccs)
-        probe_dict = {
-            f"Right player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
-                obs[:1]
-            ).item(),
-            f"Left player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
-                obs[1:2]
-            ).item(),
-        }
-        probes_fn_dict.update(probe_dict)
-        probes_fn_dict_list.append(probe_dict)
+
         
         print(f"\n\n====== Training Supervised probe for {layer_name} ======")
-        train_supervised(
+        supervised_probe = train_supervised(
             dataset_path=data_save_path,
             module=model,
             layer_name=layer_name,
@@ -772,6 +822,18 @@ if __name__ == "__main__":
             gamma=GAMMA,
             seed=SEED
         )
+        probes.append(supervised_probe)
+        probe_dict = {
+            f"Right player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
+                obs[:1]
+            ).item(),
+            f"Left player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
+                obs[1:2]
+            ).item(),
+            f"Supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(supervised_probe, obs, model).item()
+        }
+        probes_fn_dict.update(probe_dict)
+        probes_fn_dict_list.append(probe_dict)
             
     metrics = {
         "Right player value": lambda obs: model.get_value(obs[:1]).item(),
@@ -780,45 +842,8 @@ if __name__ == "__main__":
     metrics.update(probes_fn_dict)
     video_path = Path("videos") / "ccs_eval" / args.model_name
     model.name = args.model_name.replace("/", "_")
-    if (
-        args.interactive
-        or args.record_probe_videos
-        or args.record_video_with_all_probes
-    ):
-        monitor = ProbeMonitor(
-            env,
-            model,
-            model,
-            metrics,
-            args.device,
-        )
-        monitor.run(
-            args.rounds_to_record,
-            args.max_num_steps,
-        )
-        if args.interactive:
-            monitor.interactive_visualization(args.sliding_window)
-        if args.record_video_with_all_probes:
-            monitor.save_video(
-                metrics.keys(),
-                video_path / "_".join(f"{m}.{l}" for m, l in layers),
-                file_name=f"ccs_eval_{int(time.time())}",
-                sliding_window=args.sliding_window,
-            )
-        if args.record_probe_videos:
-            # Create a video for each probe
-            # Notes: A lot of computation is duplicated here. We could avoid this by refactoring playground
-            for probe_dict, layer_name in zip(probes_fn_dict_list, layer_names):
-                extra_metrics = (
-                    ["Right player value", "Left player value"]
-                    if args.record_agent_value
-                    else []
-                )
-                monitor.save_video(
-                    list(probe_dict.keys()) + extra_metrics,
-                    video_path / layer_name,
-                    file_name=f"ccs_eval_{int(time.time())}",
-                )
+    
+    monitor_probes(args, env, model, model, layers, layer_names, probes_fn_dict_list, metrics, video_path)
 
     # Evaluate probe against trajectory returns
     print(
