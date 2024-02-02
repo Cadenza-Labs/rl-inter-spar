@@ -300,14 +300,13 @@ def extract(module, layer_name, dataset_path, verbose, device, val_fraction, gam
 
         return train_activations, test_activations, train_returns, test_returns
 
-
-def supervised_prediction(lr, obs, module):
+@th.no_grad()
+def supervised_prediction(lr, obs, module, layer_name):
     """ Predict the value of an observation using a supervised model. """
     
     obs = preprocess(obs)
     _, activations = nice_hooks.run(module, obs, return_activations=True)
-    # activations = rearrange(activations, 'n p d -> (n p) d')
-    return lr.predict(activations)
+    return lr.predict(activations[layer_name].cpu())
     
     
     
@@ -830,7 +829,7 @@ if __name__ == "__main__":
             f"Left player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
                 obs[1:2]
             ).item(),
-            f"Supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(supervised_probe, obs, model).item()
+            f"Supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(supervised_probe, obs, model, layer_name)
         }
         probes_fn_dict.update(probe_dict)
         probes_fn_dict_list.append(probe_dict)
