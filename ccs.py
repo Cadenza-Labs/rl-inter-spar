@@ -829,7 +829,8 @@ if __name__ == "__main__":
             f"Left player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
                 obs[1:2]
             ).item(),
-            f"Supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(supervised_probe, obs, model, layer_name)
+            f"Left supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(supervised_probe, obs[:1], model, layer_name),
+            f"Right supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(supervised_probe, obs[1:2], model, layer_name),
         }
         probes_fn_dict.update(probe_dict)
         probes_fn_dict_list.append(probe_dict)
