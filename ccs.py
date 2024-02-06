@@ -129,10 +129,10 @@ def get_action_fn(agent, device):
     return model
 
 
-def get_hidden_activations_dataset(module, device, dataset):
+def get_hidden_activations_dataset(module, device, observation_pairs):
     """Calculate hidden layer activations for given pair dataset."""
     hidden_act_dataset = []
-    for pair in tqdm(dataset, desc="Computing hidden activations"):
+    for pair in tqdm(observation_pairs, desc="Computing hidden activations"):
         th_pair = preprocess(th.tensor(pair, dtype=th.float).to(device))
         with th.no_grad():
             _, activations = nice_hooks.run(module, th_pair, return_activations=True)
@@ -308,14 +308,12 @@ def supervised_prediction(lr, obs, module, layer_name):
     _, activations = nice_hooks.run(module, obs, return_activations=True)
     return lr.predict(activations[layer_name].cpu())
     
-    
-    
 
-def train_supervised(dataset_path, module, layer_name, verbose, device, val_fraction, gamma, seed):
+def train_supervised(dataset_path, model, layer_name, verbose, device, val_fraction, gamma, seed):
     """Linear classifier trained with supervised learning."""
     
     train_activations, test_activations, train_returns, test_returns = extract(
-        module, 
+        model, 
         layer_name, 
         dataset_path, 
         verbose, 
@@ -325,16 +323,24 @@ def train_supervised(dataset_path, module, layer_name, verbose, device, val_frac
         seed,
         normalize=False 
     )
-    # print("test_activations", test_activations.shape)
-    # print("test_returns", test_returns.shape)
     
     x_train = rearrange(train_activations, 'n p d -> (n p) d')
     x_test = rearrange(test_activations, 'n p d -> (n p) d')
     
+    # TODO: Put an own function
+    # Generate value predictions from the value network for each observation in the dataset
+    observation_pairs, _ = load_data(dataset_path, gamma)    
+    value_predictions = []
+    for obs in observation_pairs:
+        obs_tensor = preprocess(th.tensor(obs, dtype=th.float).to(device))
+        with th.no_grad():
+            value = model.get_value(obs_tensor).detach().cpu().numpy() 
+        value_predictions.append(value)
+    value_predictions = np.array(value_predictions)
+    
     # TODO: What to actually use as labels?
     y_train = rearrange(train_returns, 'n p -> (n p)')
     y_test = rearrange(test_returns, 'n p -> (n p)')
-    
     
     lr = LinearRegression()
     lr.fit(x_train.cpu(), y_train.cpu())
@@ -813,7 +819,7 @@ if __name__ == "__main__":
         print(f"\n\n====== Training Supervised probe for {layer_name} ======")
         supervised_probe = train_supervised(
             dataset_path=data_save_path,
-            module=model,
+            model=model,
             layer_name=layer_name,
             verbose=False,
             device=args.device,
