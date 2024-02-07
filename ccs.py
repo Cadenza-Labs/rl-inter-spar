@@ -256,6 +256,7 @@ def extract(module, layer_name, dataset_path, verbose, device, val_fraction, gam
         activations_path = dataset_path.with_suffix("") / "activations.pt"
         returns_path = dataset_path.with_suffix("") / "returns.pt"
         ball_approaching_path = dataset_path.with_suffix("") / "ball_pos.pt"
+        observation_path = dataset_path.with_suffix("") / "observations.pt"
         if activations_path.exists():
             if verbose:
                 print(f"Found cached activations at: {activations_path}")
@@ -277,6 +278,7 @@ def extract(module, layer_name, dataset_path, verbose, device, val_fraction, gam
             th.save(activation_pairs, activations_path)
             th.save(return_pairs, returns_path)
             th.save(ball_approaching_pairs, ball_approaching_path)
+            th.save(observation_pairs, observation_path)
         activation_pairs = (
             th.cat(
                 [pair[layer_name].unsqueeze(0) for pair in activation_pairs],
@@ -294,11 +296,14 @@ def extract(module, layer_name, dataset_path, verbose, device, val_fraction, gam
         perm = th.randperm(num_pairs, generator=th.Generator().manual_seed(seed))
         permuted_activation_pairs = activation_pairs[perm]
         permuted_return_pairs = return_pairs[perm]
+        permuted_observation_pairs = observation_pairs[perm]
         split_idx = int((1 - val_fraction) * num_pairs)
         train_activations, test_activations = permuted_activation_pairs[:split_idx], permuted_activation_pairs[split_idx:]
         train_returns, test_returns = permuted_return_pairs[:split_idx], permuted_return_pairs[split_idx:]
+        train_observations, test_observations = permuted_observation_pairs[:split_idx], permuted_observation_pairs[split_idx:]
 
-        return train_activations, test_activations, train_returns, test_returns
+
+        return train_activations, test_activations, train_returns, test_returns, train_observations, test_observations
 
 @th.no_grad()
 def supervised_prediction(lr, obs, module, layer_name):
@@ -312,7 +317,7 @@ def supervised_prediction(lr, obs, module, layer_name):
 def train_supervised(dataset_path, model, layer_name, verbose, device, val_fraction, gamma, seed):
     """Linear classifier trained with supervised learning."""
     
-    train_activations, test_activations, train_returns, test_returns = extract(
+    train_activations, test_activations, train_returns, test_returns, train_observations, test_observations = extract(
         model, 
         layer_name, 
         dataset_path, 
@@ -325,22 +330,23 @@ def train_supervised(dataset_path, model, layer_name, verbose, device, val_fract
     )
     
     x_train = rearrange(train_activations, 'n p d -> (n p) d')
-    x_test = rearrange(test_activations, 'n p d -> (n p) d')
+    # x_test = rearrange(test_activations, 'n p d -> (n p) d')
     
     # TODO: Put an own function
     # Generate value predictions from the value network for each observation in the dataset
-    observation_pairs, _ = load_data(dataset_path, gamma)    
-    value_predictions = []
-    for obs in observation_pairs:
-        obs_tensor = preprocess(th.tensor(obs, dtype=th.float).to(device))
-        with th.no_grad():
-            value = model.get_value(obs_tensor).detach().cpu().numpy() 
-        value_predictions.append(value)
-    value_predictions = np.array(value_predictions)
+    observations = rearrange(th.tensor(np.array(train_observations, dtype=np.uint8), dtype=th.uint8), 'n p h w f -> (n p) h w f')
+    values = model.get_value(observations)  # (2 * num_samples, 1)
     
+    # value_predictions = []
+    # for obs in observation_pairs:
+    #     with th.no_grad():
+    #         value = model.get_value(obs).detach().cpu().numpy() 
+    #     value_predictions.append(value)
+        
     # TODO: What to actually use as labels?
     y_train = rearrange(train_returns, 'n p -> (n p)')
-    y_test = rearrange(test_returns, 'n p -> (n p)')
+    assert y_train.shape == values.shape
+    # y_test = rearrange(test_returns, 'n p -> (n p)')
     
     lr = LinearRegression()
     lr.fit(x_train.cpu(), y_train.cpu())
@@ -829,12 +835,12 @@ if __name__ == "__main__":
         )
         probes.append(supervised_probe)
         probe_dict = {
-            f"Right player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
-                obs[:1]
-            ).item(),
-            f"Left player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
-                obs[1:2]
-            ).item(),
+            # f"Right player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
+            #     obs[:1]
+            # ).item(),
+            # f"Left player CCS probe on {layer_name}": lambda obs, ccs=ccs: ccs.elicit(
+            #     obs[1:2]
+            # ).item(),
             f"Left supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(supervised_probe, obs[:1], model, layer_name),
             f"Right supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(supervised_probe, obs[1:2], model, layer_name),
         }
