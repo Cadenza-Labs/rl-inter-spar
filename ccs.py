@@ -1,6 +1,6 @@
 from pathlib import Path
 import pickle
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge
 import torch.nn as nn
 from torch.utils import data as data_th
 from torch.utils.data import DataLoader
@@ -14,8 +14,6 @@ import csv
 from einops import rearrange
 from warnings import warn
 
-# from imitation.data.rollout import generate_trajectories, make_sample_until
-# from imitation.data.serialize import save, load_with_rewards
 import argparse
 from agents.common import get_env, Agent, preprocess
 from utils import strtobool
@@ -102,7 +100,9 @@ def load_trajectories(dataset_path, gamma):
         dataset = pickle.load(file)
     observation_pairs = sum([traj.obs for traj in dataset], [])
     reward_pairs = sum([traj.rewards for traj in dataset], [])
-    return_pairs = th.cat([calculate_returns(traj.rewards, gamma) for traj in dataset], dim=0)
+    return_pairs = th.cat(
+        [calculate_returns(traj.rewards, gamma) for traj in dataset], dim=0
+    )
     return observation_pairs, return_pairs, reward_pairs
 
 
@@ -138,14 +138,16 @@ def get_hidden_activations_dataset(module, device, observation_pairs):
 
 def is_ball_approaching(observation_pairs, device, ball_color=236):
     """Returns tensor of whether ball is approaching.
-        True, False: ball approaching left player.
-        False, True: ball approaching right player.
-        False, False: ball not present/not moving.
+    True, False: ball approaching left player.
+    False, True: ball approaching right player.
+    False, False: ball not present/not moving.
     """
     ball_approaching = []
     for pair in observation_pairs:
         # pair (players, img_x, img_y, frames)
-        ball_indices = (pair == ball_color).sum(axis=1).argmax(axis=1)  # (players, frames)
+        ball_indices = (
+            (pair == ball_color).sum(axis=1).argmax(axis=1)
+        )  # (players, frames)
         # calculate index difference of where the ball is to get its direction
         # assumption: first frame is before last frame in frame stack
         ball_index_diff = ball_indices[:, 0] - ball_indices[:, -1]  # (players,)
@@ -263,27 +265,23 @@ def normalize_wrt_ball_approaching(activation_pairs, ball_pos_pairs):
     return th.stack((combined_activations_player1, combined_activations_player2), dim=1)
 
 
-def extract(module, layer_name, dataset_path, verbose, device, val_fraction, gamma, seed, normalize=True):
+@th.no_grad()
+def extract(
+    layer_name, dataset_path, verbose, device, val_fraction, gamma, seed, normalize=True
+):
     if verbose:
         print("get hidden activations")
     # TODO: load outside of CCS to avoid dupicate
     # TODO?: we could store the activations of each layer in different files
     activations_path = dataset_path.with_suffix("") / "activations.pt"
-    returns_path = dataset_path.with_suffix("") / "returns.pt"
-    rewards_path = dataset_path.with_suffix("") / "rewards.pt"
     ball_approaching_path = dataset_path.with_suffix("") / "ball_pos.pt"
-
-    if (
-        activations_path.exists()
-        and returns_path.exists()
-        and rewards_path.exists()
-        and ball_approaching_path.exists()
-    ):
+    observation_pairs, return_pairs, reward_pairs = load_trajectories(
+        dataset_path, gamma
+    )
+    if activations_path.exists() and ball_approaching_path.exists():
         if verbose:
             print(f"Found cached activations at: {activations_path}")
         activation_pairs = th.load(activations_path)
-        return_pairs = th.load(returns_path)
-        reward_pairs = th.load(rewards_path)
         ball_approaching_pairs = th.load(ball_approaching_path)
         if verbose:
             print(f"loaded return pairs of shape {return_pairs.shape}")
@@ -292,13 +290,12 @@ def extract(module, layer_name, dataset_path, verbose, device, val_fraction, gam
     else:
         if verbose:
             print(f"No cached activations. Computing them...")
-        observation_pairs, return_pairs, reward_pairs = load_trajectories(
-            dataset_path, gamma
-        )
         activations_path.parent.mkdir(parents=True, exist_ok=True)
         if not ball_approaching_path.exists():
             ball_approaching_pairs = is_ball_approaching(observation_pairs, device)
             th.save(ball_approaching_pairs, ball_approaching_path)
+        else:
+            ball_approaching_pairs = th.load(ball_approaching_path)
         if not activations_path.exists():
             activation_pairs = get_hidden_activations_dataset(
                 model, device, observation_pairs
@@ -306,10 +303,6 @@ def extract(module, layer_name, dataset_path, verbose, device, val_fraction, gam
         else:
             activation_pairs = th.load(activations_path)
             th.save(activation_pairs, activations_path)
-        if not returns_path.exists():
-            th.save(return_pairs, returns_path)
-        if not rewards_path.exists():
-            th.save(reward_pairs, rewards_path)
     activation_pairs = (
         th.cat(
             [pair[layer_name].unsqueeze(0) for pair in activation_pairs],
@@ -319,9 +312,9 @@ def extract(module, layer_name, dataset_path, verbose, device, val_fraction, gam
         .to(device)
     )
     if normalize:
-        activation_pairs = normalize_wrt_ball_approaching_no_player(activation_pairs, ball_approaching_pairs)
-    # TODO split returns with the same permutation and save as attribute for use
-    # in eval function
+        activation_pairs = normalize_wrt_ball_approaching_no_player(
+            activation_pairs, ball_approaching_pairs
+        )
     train_activations, test_activations = data_th.random_split(
         activation_pairs,
         lengths=[val_fraction, 1 - val_fraction],
@@ -342,23 +335,41 @@ def extract(module, layer_name, dataset_path, verbose, device, val_fraction, gam
         lengths=[val_fraction, 1 - val_fraction],
         generator=th.Generator().manual_seed(seed),
     )
-    return train_activations, test_activations, train_returns, test_returns, train_rewards, test_rewards, train_observations, test_observations
+    return (
+        th.stack(list(train_activations)),
+        th.stack(list(test_activations)),
+        th.stack(list(train_returns)),
+        th.stack(list(test_returns)),
+        np.array(train_rewards),
+        np.array(test_rewards),
+        np.array(train_observations),
+        np.array(test_observations),
+    )
 
 
 @th.no_grad()
 def supervised_prediction(lr, obs, module, layer_name):
-    """ Predict the value of an observation using a supervised model. """
+    """Predict the value of an observation using a supervised model."""
 
     obs = preprocess(obs)
     _, activations = nice_hooks.run(module, obs, return_activations=True)
     return lr.predict(activations[layer_name].cpu())
 
 
-def train_supervised(dataset_path, model, layer_name, verbose, device, val_fraction, gamma, seed):
+def train_supervised(
+    dataset_path, model, layer_name, verbose, device, val_fraction, gamma, seed
+):
     """Linear classifier trained with supervised learning."""
-
-    train_activations, test_activations, train_returns, test_returns, train_observations, test_observations = extract(
-        model,
+    (
+        train_activations,
+        test_activations,
+        train_returns,
+        test_returns,
+        train_rewards,
+        test_rewards,
+        train_observations,
+        test_observations,
+    ) = extract(
         layer_name,
         dataset_path,
         verbose,
@@ -366,30 +377,26 @@ def train_supervised(dataset_path, model, layer_name, verbose, device, val_fract
         val_fraction,
         gamma,
         seed,
-        normalize=False
+        normalize=False,
     )
 
-    x_train = rearrange(train_activations, 'n p d -> (n p) d')
+    x_train = rearrange(train_activations, "n p d -> (n p) d")
     # x_test = rearrange(test_activations, 'n p d -> (n p) d')
 
     # TODO: Put an own function
     # Generate value predictions from the value network for each observation in the dataset
-    observations = rearrange(th.tensor(np.array(train_observations, dtype=np.uint8), dtype=th.uint8),
-                             'n p h w f -> (n p) h w f')
-    values = model.get_value(observations)  # (2 * num_samples, 1)
-
-    # value_predictions = []
-    # for obs in observation_pairs:
-    #     with th.no_grad():
-    #         value = model.get_value(obs).detach().cpu().numpy()
-    #     value_predictions.append(value)
+    observations = rearrange(
+        th.tensor(np.array(train_observations, dtype=np.uint8), dtype=th.float),
+        "n p h w f -> (n p) h w f",
+    ).to(device)
+    values = model.get_value(observations).squeeze()
 
     # TODO: What to actually use as labels?
-    y_train = rearrange(train_returns, 'n p -> (n p)')
+    y_train = rearrange(train_returns, "n p -> (n p)")
     assert y_train.shape == values.shape
     # y_test = rearrange(test_returns, 'n p -> (n p)')
 
-    lr = LinearRegression()
+    lr = Ridge()
     lr.fit(x_train.cpu(), y_train.cpu())
     # print("Linear regression accuracy (test): {}".format(lr.score(x_test.cpu(), y_test.cpu())))
     # print("Linear regression accuracy (train): {}".format(lr.score(x_train.cpu(), y_train.cpu())))
@@ -458,12 +465,16 @@ class CCS:
             self.best_probe.load_state_dict(th.load(self.probe_path))
             self.best_probe.to(self.device)
             self.train_activations = None
-            return
-        self.train_activations, self.test_activations, \
-            self.train_returns, self.test_returns, \
-            self.train_rewards, self.test_rewards, \
-            self.train_observations, self.test_observations = extract(
-            model,
+        (
+            self.train_activations,
+            self.test_activations,
+            self.train_returns,
+            self.test_returns,
+            self.train_rewards,
+            self.test_rewards,
+            self.train_observations,
+            self.test_observations,
+        ) = extract(
             layer_name,
             dataset_path,
             verbose,
@@ -471,7 +482,7 @@ class CCS:
             val_fraction,
             gamma,
             seed,
-            normalize=False
+            normalize=False,
         )
 
     def initialize_probe(self):
@@ -487,16 +498,8 @@ class CCS:
 
     def get_return_metrics(self):
         """Computes metrics of value probe against trajectory returns."""
-        x0 = (
-            self.test_activations[:, 0]
-            .detach()
-            .to(self.device)
-        )
-        x1 = (
-            self.test_activations[:, 1]
-            .detach()
-            .to(self.device)
-        )
+        x0 = self.test_activations[:, 0].detach().to(self.device)
+        x1 = self.test_activations[:, 1].detach().to(self.device)
         # compute returns from trajectory data assuming gamma=1
         return_1 = self.test_returns[:, 0].detach().to(self.device)
         return_2 = self.test_returns[:, 1].detach().to(self.device)
@@ -545,7 +548,11 @@ class CCS:
                 "All rewards are zero. The probe will not be calibrated. Consider using a different dataset."
             )
             return
-        self.best_probe.calibrate(self.train_activations, self.train_rewards)
+        rewards = th.tensor(self.train_rewards, dtype=th.float).to(self.device)
+        self.best_probe.calibrate(
+            self.train_activations.reshape((-1, self.train_activations.shape[-1])),
+            rewards.reshape(-1, 1),
+        )
 
     def train(self, probe):
         """Train a single probe on its layer."""
@@ -718,6 +725,12 @@ def parse_args():
         const=True,
         default=True,
     )
+    ccs_group.add_argument(
+        "--skip-ccs-probe-training",
+        help="Whether to skip the CCS probe training",
+        default=False,
+        action="store_true",
+    )
 
     vis_group = parser.add_argument_group(
         "Visualization", "Parameters for the probe visualization across time"
@@ -781,7 +794,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def monitor_probes(args, env, agent1, agent2, layers, fn_grouped_by_probe, metrics, video_path):
+def monitor_probes(
+    args, env, agent1, agent2, layers, fn_grouped_by_probe, metrics, video_path
+):
     if (
         args.interactive
         or args.record_probe_videos
@@ -826,11 +841,10 @@ def monitor_probes(args, env, agent1, agent2, layers, fn_grouped_by_probe, metri
                     list(probe_fn_dict.keys()) + extra_metrics,
                     video_path / probe_name,
                     file_name=f"ccs_eval_{int(time.time())}"
-                              + ("_pv" if args.record_agent_value else ""),
+                    + ("_pv" if args.record_agent_value else ""),
                     sliding_window=args.sliding_window,
                     max_video_length=args.max_video_length,
                 )
-                print("Saved videos to", video_path / layer_name)
 
 
 if __name__ == "__main__":
@@ -882,43 +896,44 @@ if __name__ == "__main__":
     probes = []
     probes_fn_dict = {}
     fn_grouped_by_probe = {}
-    for inf_loss_weight in args.informative_loss_weights:
-        for layer_name in layer_names:
-            print(
-                "\n\n"
-                "===================================\n"
-                f"Training CCS probe for {layer_name}\n"
-                f"informative loss = {inf_loss_weight}\n"
-                "==================================="
-            )
-            ccs = CCS(
-                env,
-                model,
-                layer_name,
-                data_save_path,
-                informative_loss_weight=inf_loss_weight,
-                device=args.device,
-                num_tries=args.best_of_n,
-                load=args.load_best_probe,
-                # verbose=True,
-            )
-            if ccs.best_probe is None:
-                ccs.repeated_train(save=args.save_probe)
-            ccs.calibrate()
-            probes.append(ccs)
-            inf_loss_string = f"with inf loss weight {inf_loss_weight :.2g}"
-            probe_dict = {
-                f"Right player CCS probe on {layer_name} {inf_loss_string}": lambda obs, ccs=ccs: ccs.elicit(
-                    obs[:1]
-                ).item(),
-                f"Left player CCS probe on {layer_name} {inf_loss_string}": lambda obs, ccs=ccs: ccs.elicit(
-                    obs[1:2]
-                ).item(),
-            }
-            probes_fn_dict.update(probe_dict)
-            fn_grouped_by_probe[
-                f"{layer_name}_inf_loss_weight_{inf_loss_weight: g}"
-            ] = probe_dict
+    if not args.skip_ccs_probe_training:
+        for inf_loss_weight in args.informative_loss_weights:
+            for layer_name in layer_names:
+                print(
+                    "\n\n"
+                    "===================================\n"
+                    f"Training CCS probe for {layer_name}\n"
+                    f"informative loss = {inf_loss_weight}\n"
+                    "==================================="
+                )
+                ccs = CCS(
+                    env,
+                    model,
+                    layer_name,
+                    data_save_path,
+                    informative_loss_weight=inf_loss_weight,
+                    device=args.device,
+                    num_tries=args.best_of_n,
+                    load=args.load_best_probe,
+                    # verbose=True,
+                )
+                if ccs.best_probe is None:
+                    ccs.repeated_train(save=args.save_probe)
+                ccs.calibrate()
+                probes.append(ccs)
+                inf_loss_string = f"with inf loss weight {inf_loss_weight :.2g}"
+                probe_dict = {
+                    f"Right player CCS probe on {layer_name} {inf_loss_string}": lambda obs, ccs=ccs: ccs.elicit(
+                        obs[:1]
+                    ).item(),
+                    f"Left player CCS probe on {layer_name} {inf_loss_string}": lambda obs, ccs=ccs: ccs.elicit(
+                        obs[1:2]
+                    ).item(),
+                }
+                probes_fn_dict.update(probe_dict)
+                fn_grouped_by_probe[
+                    f"{layer_name}_inf_loss_weight_{inf_loss_weight: g}"
+                ] = probe_dict
     for layer_name in layer_names:
         print(f"\n\n====== Training Supervised probe for {layer_name} ======")
         supervised_probe = train_supervised(
@@ -929,21 +944,19 @@ if __name__ == "__main__":
             device=args.device,
             val_fraction=WEIGHT_DECAY,
             gamma=GAMMA,
-            seed=SEED
+            seed=SEED,
         )
         probes.append(supervised_probe)
         probe_dict = {
-            f"Left supervised probe on {layer_name}": lambda obs,
-                                                             supervised_probe=supervised_probe: supervised_prediction(
-                supervised_probe, obs[:1], model, layer_name),
-            f"Right supervised probe on {layer_name}": lambda obs,
-                                                              supervised_probe=supervised_probe: supervised_prediction(
-                supervised_probe, obs[1:2], model, layer_name),
+            f"Right supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(
+                supervised_probe, obs[:1], model, layer_name
+            ),
+            f"Left supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(
+                supervised_probe, obs[1:2], model, layer_name
+            ),
         }
         probes_fn_dict.update(probe_dict)
-        fn_grouped_by_probe[
-            f"{layer_name}_supervised_probe"
-        ] = probe_dict
+        fn_grouped_by_probe[f"{layer_name}_supervised_probe"] = probe_dict
 
     metrics = {
         "Right player value": lambda obs: model.get_value(obs[:1]).item(),
@@ -952,11 +965,13 @@ if __name__ == "__main__":
     metrics.update(probes_fn_dict)
     video_path = Path("videos") / "ccs_eval" / args.model_name
     model.name = args.model_name.replace("/", "_")
-    monitor_probes(args, env, model, model, layers, fn_grouped_by_probe, metrics, video_path)
-
-    # Evaluate probe against trajectory returns
-    print(
-        "Best probe CCS eval metrics: v1_loss={:.5f}, v2_loss={:.5f}, avg_value_sum={:.5f}, avg_return_sum={:.5f}".format(
-            *ccs.get_return_metrics()
-        )
+    monitor_probes(
+        args, env, model, model, layers, fn_grouped_by_probe, metrics, video_path
     )
+    if not args.skip_ccs_probe_training:
+        # Evaluate probe against trajectory returns
+        print(
+            "Best probe CCS eval metrics: v1_loss={:.5f}, v2_loss={:.5f}, avg_value_sum={:.5f}, avg_return_sum={:.5f}".format(
+                *ccs.get_return_metrics()
+            )
+        )
