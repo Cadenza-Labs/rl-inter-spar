@@ -158,7 +158,7 @@ def is_ball_approaching(observation_pairs, device, ball_color=236):
     return th.tensor(ball_approaching, dtype=th.float).to(device)
 
 
-class ValueProbe(nn.Module):
+class LinearProbe(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.linear = nn.Linear(dim, 1)
