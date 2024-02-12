@@ -158,33 +158,6 @@ def is_ball_approaching(observation_pairs, device, ball_color=236):
     return th.tensor(ball_approaching, dtype=th.float).to(device)
 
 
-class LinearProbe(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.linear = nn.Linear(dim, 1)
-        self.sign = 1
-
-    def forward(self, x):
-        h = self.linear(x.flatten(start_dim=1))
-        return th.tanh(h) * self.sign
-
-    @th.no_grad()
-    def calibrate(self, hidden_activations, rewards):
-        """Calibrate the probe
-        Args:
-            hidden_activations: hidden activations of shape (n, d)
-            rewards: rewards of shape (n, 1)
-        """
-        # Compute the loss for forward and -forward and choose the sign that minimizes the loss
-        loss = nn.MSELoss()
-        positive_loss = loss(self.forward(hidden_activations), rewards)
-        negative_loss = loss(-self.forward(hidden_activations), rewards)
-        if positive_loss < negative_loss:
-            self.sign = 1
-        else:
-            self.sign = -1
-
-
 def discount_cumsum(x, discount):
     """
     magic from rllab for computing discounted cumulative sums of vectors.
@@ -404,18 +377,47 @@ def train_supervised(
 
     return lr
 
+class Probe(nn.Module):
+    @th.no_grad()
+    def calibrate(self, hidden_activations, rewards):
+        """Calibrate the probe
+        Args:
+            hidden_activations: hidden activations of shape (n, d)
+            rewards: rewards of shape (n, 1)
+        """
+        # Compute the loss for forward and -forward and choose the sign that minimizes the loss
+        loss = nn.MSELoss()
+        positive_loss = loss(self.forward(hidden_activations), rewards)
+        negative_loss = loss(-self.forward(hidden_activations), rewards)
+        if positive_loss < negative_loss:
+            self.sign = 1
+        else:
+            self.sign = -1
 
-class MLPProbe(nn.Module):
+
+class MLPProbe(Probe):
     def __init__(self, dim):
         super().__init__()
         self.linear1 = nn.Linear(dim, 100)
         self.linear2 = nn.Linear(100, 1)
 
     def forward(self, x):
-        h = F.relu(self.linear1(x))
+        h = F.relu(self.linear1(x.flatten(start_dim=1)))
         o = self.linear2(h)
         return th.sigmoid(o)
 
+    
+class LinearProbe(Probe):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, 1)
+        self.sign = 1
+
+    def forward(self, x):
+        h = self.linear(x.flatten(start_dim=1))
+        return th.tanh(h) * self.sign
+    
+    
 class CCS:
     """Implementation of contrast consistent search for value functions."""
 
@@ -750,7 +752,7 @@ def parse_args():
     ccs_group.add_argument(
         "--linear",
         help="Whether to use a linear probe (True) or a MLP probe (False)",
-        type=bool,
+        type=lambda x: bool(strtobool(x)),
         default=True,
     )
     ccs_group.add_argument(
