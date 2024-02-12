@@ -1,5 +1,6 @@
 from pathlib import Path
 import pickle
+import torch.nn.functional as F
 from sklearn.linear_model import LinearRegression
 import torch.nn as nn
 from torch.utils import data as data_th
@@ -157,16 +158,6 @@ def is_ball_approaching(observation_pairs, device, ball_color=236):
         ball_approaching_player = ball_index_diff > 0
         ball_approaching.append(ball_approaching_player)
     return th.tensor(ball_approaching, dtype=th.float).to(device)
-
-
-class ValueProbe(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.linear = nn.Linear(dim, 1)
-
-    def forward(self, x):
-        h = self.linear(x.flatten(start_dim=1))
-        return th.tanh(h)
 
 
 def discount_cumsum(x, discount):
@@ -356,6 +347,25 @@ def train_supervised(dataset_path, model, layer_name, verbose, device, val_fract
     return lr
 
 
+class LinearProbe(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, 1)
+
+    def forward(self, x):
+        h = self.linear(x.flatten(start_dim=1))
+        return th.tanh(h)
+
+class MLPProbe(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear1 = nn.Linear(dim, 100)
+        self.linear2 = nn.Linear(100, 1)
+
+    def forward(self, x):
+        h = F.relu(self.linear1(x))
+        o = self.linear2(h)
+        return th.sigmoid(o)
 
 class CCS:
     """Implementation of contrast consistent search for value functions."""
@@ -378,6 +388,7 @@ class CCS:
         gamma=GAMMA,
         seed=SEED,
         load=True,
+        linear=True
     ):
         self.env = env
         self.module = module
@@ -397,6 +408,7 @@ class CCS:
         self.dataset_path = dataset_path.with_suffix("")
         self.best_probe = None
         self.probe_path = self.dataset_path / "probes" / f"{self.layer_name}.pt"
+        self.linear = linear
 
         if load and self.probe_path.exists():
             print(f"Loading probe from {self.probe_path}")
@@ -432,7 +444,15 @@ class CCS:
     
     def initialize_probe(self):
         dim = self.train_activations[0][0].flatten().shape[0]
-        return ValueProbe(dim).to(self.device)
+        
+        
+        if self.linear:
+            print("Probe is linear")
+            return LinearProbe(dim).to(self.device)
+        else:
+            print("Probe is MLP")
+            return MLPProbe(dim).to(self.device)
+        
 
     def get_loss(self, value_1, value_2):
         """Returns the CCS loss for two values each of shape (n,1) or (n,)."""
@@ -650,6 +670,12 @@ def parse_args():
         type=lambda x: bool(strtobool(x)),
         nargs="?",
         const=True,
+        default=True,
+    )
+    ccs_group.add_argument(
+        "--linear",
+        help="Whether to use a linear probe (True) or a MLP probe (False)",
+        type=bool,
         default=True,
     )
     vis_group = parser.add_argument_group(

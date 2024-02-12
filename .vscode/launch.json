@@ -18,7 +18,9 @@
                 "--record-probe-videos",
                 "--record-agent-value",
                 "--best-of-n",
-                "1"
+                "1",
+                "--linear",
+                "False"
             ]
         }
     ]
