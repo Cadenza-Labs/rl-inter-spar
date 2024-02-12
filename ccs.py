@@ -932,6 +932,7 @@ if __name__ == "__main__":
                     "===================================\n"
                     f"Training CCS probe for {layer_name}\n"
                     f"informative loss = {inf_loss_weight}\n"
+                    f"Probe is linear: {'True' if args.linear else 'False'}\n"
                     "==================================="
                 )
                 ccs = CCS(
@@ -943,6 +944,7 @@ if __name__ == "__main__":
                     device=args.device,
                     num_tries=args.best_of_n,
                     load=args.load_best_probe,
+                    linear=args.linear,
                     # verbose=True,
                 )
                 if ccs.best_probe is None:

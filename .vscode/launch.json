@@ -20,7 +20,7 @@
                 "--best-of-n",
                 "1",
                 "--linear",
-                "False"
+                "false"
             ]
         }
     ]
