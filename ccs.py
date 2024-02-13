@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from sklearn.linear_model import Ridge
 import torch.nn as nn
 from torch.utils import data as data_th
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 import torch as th
 import numpy as np
 import scipy
@@ -17,6 +17,7 @@ from warnings import warn
 
 import argparse
 from agents.common import get_env, Agent, preprocess
+from classifier import Classifier
 from utils import strtobool
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm, trange
@@ -327,7 +328,7 @@ def supervised_prediction(lr, obs, module, layer_name):
 
     obs = preprocess(obs)
     _, activations = nice_hooks.run(module, obs, return_activations=True)
-    return lr.predict(activations[layer_name].cpu())
+    return lr.predict(activations[layer_name])
 
 
 def train_supervised(
@@ -363,6 +364,7 @@ def train_supervised(
         "n p h w f -> (n p) h w f",
     ).to(device)
     y_train = model.get_value(observations).squeeze().detach().cpu().numpy()
+    assert x_train.shape[0] == y_train.shape[0]
 
     # lr = LRProbe.train(x_train, values, device=device)
     lr = Ridge()
@@ -389,57 +391,39 @@ class Probe(nn.Module):
         else:
             self.sign = -1
 
-class LRProbe(nn.Module):
-    def __init__(self, d_in):
-        super().__init__()
-        # Define a linear layer followed by tanh activation
-        self.net = nn.Sequential(
-            nn.Linear(d_in, 1, bias=True),
-            nn.Tanh()  # Add Tanh activation to ensure output is between -1 and 1
-        )
+class SupervisedProbe(nn.Module):
+    def __init__(self, input_dim, device):
+        super(SupervisedProbe, self).__init__()
+        self.linear = nn.Linear(input_dim, 1)  # Output dimension is 1 for value prediction
+        self.device = device
+        self.to(device)
 
-    def forward(self, x, iid=None):
-        # Forward pass will output values constrained between -1 and 1
-        return self.net(x).squeeze(-1)
-
-    def pred(self, x, iid=None):
-        # For regression tasks, this could return raw predictions directly
-        # Adjustments or post-processing can be applied based on specific needs
-        return self(x)
+    def forward(self, x):
+        return self.linear(x)
     
-    @staticmethod
-    def train(self, probe):
-        """Train a single probe on its layer."""
-        batch_size = (
-            len(self.train_activations) if self.batch_size == -1 else self.batch_size
-        )
-        dataloader = DataLoader(self.train_activations, batch_size, shuffle=True)
-
-        # set up optimizer
-        optimizer = th.optim.AdamW(
-            probe.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-        )
-
-        # Start training (full batch)
-        for batch in dataloader:
-            v1 = probe(batch)
-
-            # get the corresponding loss
-            loss = self.get_loss(v1)
-
-            # update the parameters
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        return probe
+    def predict(self, x):
+        self.forward(x)
     
-    @property
-    def direction(self):
-        # Access the weights of the linear layer
-        return self.net[0].weight.data
+    def train(self, x_train, y_train, num_epochs=100, learning_rate=0.01, batch_size=64):
+        dataset = TensorDataset(x_train, y_train)
+        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        """Trains the model."""
+        criterion = nn.MSELoss()  # Mean Squared Error Loss
+        optimizer = th.optim.SGD(self.parameters(), lr=learning_rate)  # Stochastic Gradient Descent
+        
+        for epoch in range(num_epochs):
+            for inputs, targets in train_loader:
+                optimizer.zero_grad()  # Zero the parameter gradients
+                outputs = self(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()  # Backpropagation
+                optimizer.step()  # Update model parameters
+            
+            if epoch % 10 == 0:  # Print loss every 10 epochs
+                print(f'Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}')
 
+    
 
 class MLPProbe(Probe):
     def __init__(self, dim):
