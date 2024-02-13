@@ -13,14 +13,14 @@
                 "--layer-indicies",
                 "8",
                 "--modules",
-                "actor_network", // critic_network
+                "critic_network", // critic_network
                 "--from-hf",
                 "--record-probe-videos",
                 "--record-agent-value",
                 "--best-of-n",
                 "1",
                 "--linear",
-                "False"
+                "True"
             ]
         }
     ]

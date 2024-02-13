@@ -355,7 +355,6 @@ def train_supervised(
     )
 
     x_train = rearrange(train_activations, "n p d -> (n p) d")
-    # x_test = rearrange(test_activations, 'n p d -> (n p) d')
 
     # TODO: Put an own function
     # Generate value predictions from the value network for each observation in the dataset
@@ -363,15 +362,11 @@ def train_supervised(
         th.tensor(np.array(train_observations, dtype=np.uint8), dtype=th.float),
         "n p h w f -> (n p) h w f",
     ).to(device)
-    values = model.get_value(observations).squeeze()
+    y_train = model.get_value(observations).squeeze().detach().cpu().numpy()
 
-    # TODO: What to actually use as labels?
-    y_train = rearrange(train_returns, "n p -> (n p)")
-    assert y_train.shape == values.shape
-    # y_test = rearrange(test_returns, 'n p -> (n p)')
-
+    # lr = LRProbe.train(x_train, values, device=device)
     lr = Ridge()
-    lr.fit(x_train.cpu(), y_train.cpu())
+    lr.fit(x_train.cpu(), y_train)
     # print("Linear regression accuracy (test): {}".format(lr.score(x_test.cpu(), y_test.cpu())))
     # print("Linear regression accuracy (train): {}".format(lr.score(x_train.cpu(), y_train.cpu())))
 
@@ -393,6 +388,57 @@ class Probe(nn.Module):
             self.sign = 1
         else:
             self.sign = -1
+
+class LRProbe(nn.Module):
+    def __init__(self, d_in):
+        super().__init__()
+        # Define a linear layer followed by tanh activation
+        self.net = nn.Sequential(
+            nn.Linear(d_in, 1, bias=True),
+            nn.Tanh()  # Add Tanh activation to ensure output is between -1 and 1
+        )
+
+    def forward(self, x, iid=None):
+        # Forward pass will output values constrained between -1 and 1
+        return self.net(x).squeeze(-1)
+
+    def pred(self, x, iid=None):
+        # For regression tasks, this could return raw predictions directly
+        # Adjustments or post-processing can be applied based on specific needs
+        return self(x)
+    
+    @staticmethod
+    def train(self, probe):
+        """Train a single probe on its layer."""
+        batch_size = (
+            len(self.train_activations) if self.batch_size == -1 else self.batch_size
+        )
+        dataloader = DataLoader(self.train_activations, batch_size, shuffle=True)
+
+        # set up optimizer
+        optimizer = th.optim.AdamW(
+            probe.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
+
+        # Start training (full batch)
+        for batch in dataloader:
+            v1 = probe(batch)
+
+            # get the corresponding loss
+            loss = self.get_loss(v1)
+
+            # update the parameters
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        return probe
+    
+    @property
+    def direction(self):
+        # Access the weights of the linear layer
+        return self.net[0].weight.data
 
 
 class MLPProbe(Probe):
