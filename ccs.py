@@ -17,7 +17,6 @@ from warnings import warn
 
 import argparse
 from agents.common import get_env, Agent, preprocess
-from classifier import Classifier
 from utils import strtobool
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm, trange
@@ -242,7 +241,14 @@ def normalize_wrt_ball_approaching(activation_pairs, ball_pos_pairs):
 
 @th.no_grad()
 def extract(
-    layer_name, dataset_path, verbose, device, val_fraction, gamma, seed, normalize=True
+    layer_name,
+    dataset_path,
+    verbose,
+    device,
+    test_fraction,
+    gamma,
+    seed,
+    normalize=True,
 ):
     if verbose:
         print("get hidden activations")
@@ -292,22 +298,22 @@ def extract(
         )
     train_activations, test_activations = data_th.random_split(
         activation_pairs,
-        lengths=[val_fraction, 1 - val_fraction],
+        lengths=[1 - test_fraction, test_fraction],
         generator=th.Generator().manual_seed(seed),
     )
     train_returns, test_returns = data_th.random_split(
         return_pairs,
-        lengths=[val_fraction, 1 - val_fraction],
+        lengths=[1 - test_fraction, test_fraction],
         generator=th.Generator().manual_seed(seed),
     )
     train_rewards, test_rewards = data_th.random_split(
         reward_pairs,
-        lengths=[val_fraction, 1 - val_fraction],
+        lengths=[1 - test_fraction, test_fraction],
         generator=th.Generator().manual_seed(seed),
     )
     train_observations, test_observations = data_th.random_split(
         observation_pairs,
-        lengths=[val_fraction, 1 - val_fraction],
+        lengths=[1 - test_fraction, test_fraction],
         generator=th.Generator().manual_seed(seed),
     )
     return (
@@ -328,7 +334,8 @@ def supervised_prediction(lr, obs, module, layer_name):
 
     obs = preprocess(obs)
     _, activations = nice_hooks.run(module, obs, return_activations=True)
-    return lr.predict(activations[layer_name])
+    act = activations[layer_name].flatten(start_dim=1)
+    return lr(act)
 
 
 def train_supervised(
@@ -354,27 +361,45 @@ def train_supervised(
         seed,
         normalize=False,
     )
-
-    x_train = rearrange(train_activations, "n p d -> (n p) d")
+    train_activations = train_activations.flatten(start_dim=2)
+    test_activations = test_activations.flatten(start_dim=2)
+    x_train = rearrange(train_activations, "n p d -> (n p) d").cpu().numpy()
+    x_test = rearrange(test_activations, "n p d -> (n p) d").cpu().numpy()
 
     # TODO: Put an own function
     # Generate value predictions from the value network for each observation in the dataset
-    observations = rearrange(
+    train_obs = rearrange(
         th.tensor(np.array(train_observations, dtype=np.uint8), dtype=th.float),
         "n p h w f -> (n p) h w f",
     ).to(device)
-    y_train = model.get_value(observations).squeeze().detach().cpu().numpy()
+    test_obs = rearrange(
+        th.tensor(np.array(test_observations, dtype=np.uint8), dtype=th.float),
+        "n p h w f -> (n p) h w f",
+    ).to(device)
+    with th.no_grad():
+        y_train = model.get_value(train_obs).squeeze().detach().cpu().numpy()
+        y_test = model.get_value(test_obs).squeeze().detach().cpu().numpy()
     assert x_train.shape[0] == y_train.shape[0]
+    assert x_test.shape[0] == y_test.shape[0]
 
-    # lr = LRProbe.train(x_train, values, device=device)
     lr = Ridge()
-    lr.fit(x_train.cpu(), y_train)
-    # print("Linear regression accuracy (test): {}".format(lr.score(x_test.cpu(), y_test.cpu())))
-    # print("Linear regression accuracy (train): {}".format(lr.score(x_train.cpu(), y_train.cpu())))
+    print(
+        f"Fitting a linear regression with {len(x_train)} samples and {x_train.shape[1]} features"
+    )
+    lr.fit(x_train, y_train)
+    print("Linear regression accuracy (test): {}".format(lr.score(x_test, y_test)))
+    print("Linear regression accuracy (train): {}".format(lr.score(x_train, y_train)))
+    # Convert lr to nn.Linear
+    module = nn.Linear(x_train.shape[1], 1)
+    module.weight.data.copy_(th.tensor(lr.coef_, device=device))
+    module.bias.data.copy_(th.tensor(lr.intercept_, device=device))
+    return module.to(device)
 
-    return lr
 
 class Probe(nn.Module):
+    def __init__(self):
+        self.sign = 1
+
     @th.no_grad()
     def calibrate(self, hidden_activations, rewards):
         """Calibrate the probe
@@ -391,39 +416,6 @@ class Probe(nn.Module):
         else:
             self.sign = -1
 
-class SupervisedProbe(nn.Module):
-    def __init__(self, input_dim, device):
-        super(SupervisedProbe, self).__init__()
-        self.linear = nn.Linear(input_dim, 1)  # Output dimension is 1 for value prediction
-        self.device = device
-        self.to(device)
-
-    def forward(self, x):
-        return self.linear(x)
-    
-    def predict(self, x):
-        self.forward(x)
-    
-    def train(self, x_train, y_train, num_epochs=100, learning_rate=0.01, batch_size=64):
-        dataset = TensorDataset(x_train, y_train)
-        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-        
-        """Trains the model."""
-        criterion = nn.MSELoss()  # Mean Squared Error Loss
-        optimizer = th.optim.SGD(self.parameters(), lr=learning_rate)  # Stochastic Gradient Descent
-        
-        for epoch in range(num_epochs):
-            for inputs, targets in train_loader:
-                optimizer.zero_grad()  # Zero the parameter gradients
-                outputs = self(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()  # Backpropagation
-                optimizer.step()  # Update model parameters
-            
-            if epoch % 10 == 0:  # Print loss every 10 epochs
-                print(f'Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}')
-
-    
 
 class MLPProbe(Probe):
     def __init__(self, dim):
@@ -434,20 +426,19 @@ class MLPProbe(Probe):
     def forward(self, x):
         h = F.relu(self.linear1(x.flatten(start_dim=1)))
         o = self.linear2(h)
-        return th.sigmoid(o)
+        return th.tanh(o) * self.sign
 
-    
+
 class LinearProbe(Probe):
     def __init__(self, dim):
         super().__init__()
         self.linear = nn.Linear(dim, 1)
-        self.sign = 1
 
     def forward(self, x):
         h = self.linear(x.flatten(start_dim=1))
         return th.tanh(h) * self.sign
-    
-    
+
+
 class CCS:
     """Implementation of contrast consistent search for value functions."""
 
@@ -470,7 +461,7 @@ class CCS:
         gamma=GAMMA,
         seed=SEED,
         load=True,
-        linear=True
+        linear=True,
     ):
         self.env = env
         self.model = model
@@ -533,15 +524,12 @@ class CCS:
 
     def initialize_probe(self):
         dim = self.train_activations[0][0].flatten().shape[0]
-        
-        
         if self.linear:
             print("Probe is linear")
             return LinearProbe(dim).to(self.device)
         else:
             print("Probe is MLP")
             return MLPProbe(dim).to(self.device)
-        
 
     def get_loss(self, value_1, value_2):
         """Returns the CCS loss for two values each of shape (n,1) or (n,)."""
@@ -1010,12 +998,12 @@ if __name__ == "__main__":
         )
         probes.append(supervised_probe)
         probe_dict = {
-            f"Right supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(
+            f"Right supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe, layer_name=layer_name: supervised_prediction(
                 supervised_probe, obs[:1], model, layer_name
-            ),
-            f"Left supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe: supervised_prediction(
+            ).item(),
+            f"Left supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe, layer_name=layer_name: supervised_prediction(
                 supervised_probe, obs[1:2], model, layer_name
-            ),
+            ).item(),
         }
         probes_fn_dict.update(probe_dict)
         fn_grouped_by_probe[f"{layer_name}_supervised_probe"] = probe_dict
