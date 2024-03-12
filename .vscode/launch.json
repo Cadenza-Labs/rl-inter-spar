@@ -8,15 +8,20 @@
             "program": "${workspaceFolder}/ccs.py",
             "console": "integratedTerminal",
             "args": [
-                "--model_path",
+                "--model-path",
                 "pong_v3__ppo_no_shared_weights_continue__1__1701523626/ppo_no_shared_weights_continue.cleanrl_model_3050",
-                "--layer_indicies",
+                "--layer-indicies",
                 "8",
                 "--modules",
-                "critic_network",
-                "--from_hf",
+                "actor_network", // critic_network
+                "--from-hf",
+                "--record-probe-videos",
+                "--record-agent-value",
+                "--best-of-n",
+                "1",
+                "--linear",
+                "True"
             ]
         }
     ]
 }
-

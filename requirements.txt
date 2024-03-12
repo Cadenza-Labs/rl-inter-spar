@@ -8,3 +8,4 @@ huggingface_hub
 multi-agent-ale-py
 autorom[accept-rom-license]
 ale-py
+einops

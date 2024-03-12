@@ -7,7 +7,7 @@
 ```
 conda create -n spar python==3.10
 conda activate spar
-conda install cmake
+conda install cmake ffmpeg
 python -m pip install -r requirements.txt
 AutoROM --accept-license
 ```
