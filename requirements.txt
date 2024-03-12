@@ -1,3 +1,10 @@
 stable_baselines3
 opencv-python
 ipykernel
+imitation
+pettingzoo
+supersuit
+huggingface_hub
+multi-agent-ale-py
+autorom[accept-rom-license]
+ale-py

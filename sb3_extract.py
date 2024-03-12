@@ -38,5 +38,7 @@ def get_extractor_activation(model, obs: th.Tensor):
     """
     Returns activations hooked from the sb3 model's feature_extractor
     """
-    result, cache = get_activations(model.policy.features_extractor, sb3_preprocess(model, obs))
+    result, cache = get_activations(
+        model.policy.features_extractor, sb3_preprocess(model, obs)
+    )
     return result, cache

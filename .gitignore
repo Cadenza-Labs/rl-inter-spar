@@ -1,3 +1,10 @@
+# Project
+datasets
+hf_models
+experiments
+videos
+runs
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

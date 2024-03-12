@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Debug ccs.py",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/ccs.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--model_path",
+                "pong_v3__ppo_no_shared_weights_continue__1__1701523626/ppo_no_shared_weights_continue.cleanrl_model_3050",
+                "--layer_indicies",
+                "8",
+                "--modules",
+                "critic_network",
+                "--from_hf",
+            ]
+        }
+    ]
+}
+
