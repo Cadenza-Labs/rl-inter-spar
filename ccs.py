@@ -398,6 +398,7 @@ def train_supervised(
 
 class Probe(nn.Module):
     def __init__(self):
+        super().__init__()
         self.sign = 1
 
     @th.no_grad()
@@ -592,7 +593,7 @@ class CCS:
             return
         rewards = th.tensor(self.train_rewards, dtype=th.float).to(self.device)
         self.best_probe.calibrate(
-            self.train_activations.reshape((-1, self.train_activations.shape[-1])),
+            self.train_activations.reshape((-1, *self.train_activations.shape[2:])),
             rewards.reshape(-1, 1),
         )
 
@@ -776,6 +777,12 @@ def parse_args():
     ccs_group.add_argument(
         "--skip-ccs-probe-training",
         help="Whether to skip the CCS probe training",
+        default=False,
+        action="store_true",
+    )
+    ccs_group.add_argument(
+        "--skip-supervised-probe",
+        help="Whether to skip the supervised probe training",
         default=False,
         action="store_true",
     )
@@ -984,29 +991,30 @@ if __name__ == "__main__":
                 fn_grouped_by_probe[
                     f"{layer_name}_inf_loss_weight_{inf_loss_weight: g}"
                 ] = probe_dict
-    for layer_name in layer_names:
-        print(f"\n\n====== Training Supervised probe for {layer_name} ======")
-        supervised_probe = train_supervised(
-            dataset_path=data_save_path,
-            model=model,
-            layer_name=layer_name,
-            verbose=False,
-            device=args.device,
-            val_fraction=WEIGHT_DECAY,
-            gamma=GAMMA,
-            seed=SEED,
-        )
-        probes.append(supervised_probe)
-        probe_dict = {
-            f"Right supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe, layer_name=layer_name: supervised_prediction(
-                supervised_probe, obs[:1], model, layer_name
-            ).item(),
-            f"Left supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe, layer_name=layer_name: supervised_prediction(
-                supervised_probe, obs[1:2], model, layer_name
-            ).item(),
-        }
-        probes_fn_dict.update(probe_dict)
-        fn_grouped_by_probe[f"{layer_name}_supervised_probe"] = probe_dict
+    if not args.skip_supervised_probe:
+        for layer_name in layer_names:
+            print(f"\n\n====== Training Supervised probe for {layer_name} ======")
+            supervised_probe = train_supervised(
+                dataset_path=data_save_path,
+                model=model,
+                layer_name=layer_name,
+                verbose=False,
+                device=args.device,
+                val_fraction=WEIGHT_DECAY,
+                gamma=GAMMA,
+                seed=SEED,
+            )
+            probes.append(supervised_probe)
+            probe_dict = {
+                f"Right supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe, layer_name=layer_name: supervised_prediction(
+                    supervised_probe, obs[:1], model, layer_name
+                ).item(),
+                f"Left supervised probe on {layer_name}": lambda obs, supervised_probe=supervised_probe, layer_name=layer_name: supervised_prediction(
+                    supervised_probe, obs[1:2], model, layer_name
+                ).item(),
+            }
+            probes_fn_dict.update(probe_dict)
+            fn_grouped_by_probe[f"{layer_name}_supervised_probes"] = probe_dict
 
     metrics = {
         "Right player value": lambda obs: model.get_value(obs[:1]).item(),
