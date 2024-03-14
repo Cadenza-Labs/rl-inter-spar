@@ -122,7 +122,9 @@ class ProbeMonitor:
         # Plot a vertical line for each x when reward != 0
         for i, reward in enumerate(self.rewards):
             if reward != 0:
-                ax2.axvline(x=i, color="black", linestyle="--", alpha=0.5, linewidth=0.5)
+                ax2.axvline(
+                    x=i, color="black", linestyle="--", alpha=0.5, linewidth=0.5
+                )
         ax2.set_xlim(0, sliding_window)
         ax2.set_ylim(ymin, ymax)
         ax2.set_xlabel("Time")
@@ -311,3 +313,56 @@ class ProbeMonitor:
         animation.save(str(video_path / f"{f_name}.mp4"), fps=30)
         pbar.close()
         print("Saved video to " + str(video_path / f"{f_name}.mp4"))
+
+
+def monitor_probes(
+    args, env, agent1, agent2, layers, fn_grouped_by_probe, metrics, video_path
+):
+    if (
+        args.interactive
+        or args.record_probe_videos
+        or args.record_video_with_all_probes
+    ):
+        monitor = ProbeMonitor(
+            env,
+            agent1,
+            agent2,
+            metrics,
+            args.device,
+        )
+        print("\nMonitoring probe...")
+        monitor.run(
+            args.rounds_to_record,
+            args.max_num_steps,
+        )
+        if args.interactive:
+            print("Starting interactive visualization...")
+            monitor.interactive_visualization(args.sliding_window)
+            print("Interactive visualization finished.")
+        if args.record_video_with_all_probes:
+            print("Recording video with all probes...")
+            monitor.save_video(
+                metrics.keys(),
+                video_path / "_".join(f"{m}.{l}" for m, l in layers),
+                file_name=f"ccs_eval_{int(time.time())}",
+                sliding_window=args.sliding_window,
+                max_video_length=args.max_video_length,
+            )
+        if args.record_probe_videos:
+            print("Recording a video for each probe...")
+            # Create a video for each probe
+            # Notes: A lot of computation is duplicated here. We could avoid this by refactoring playground
+            for probe_name, probe_fn_dict in fn_grouped_by_probe.items():
+                extra_metrics = (
+                    ["Right player value", "Left player value"]
+                    if args.record_agent_value
+                    else []
+                )
+                monitor.save_video(
+                    list(probe_fn_dict.keys()) + extra_metrics,
+                    video_path / probe_name,
+                    file_name=f"ccs_eval_{int(time.time())}"
+                    + ("_pv" if args.record_agent_value else ""),
+                    sliding_window=args.sliding_window,
+                    max_video_length=args.max_video_length,
+                )
