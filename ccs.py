@@ -21,57 +21,6 @@ GAMMA = 0.99
 SEED = 44
 
 
-def normalize(self, activations):
-    """
-    Mean-normalizes the data x (of shape (n, d))
-    If self.var_normalize, also divides by the standard deviation
-    """
-    normalized_x = activations - activations.mean(axis=0, keepdims=True)
-    if self.var_normalize:
-        normalized_x /= normalized_x.std(axis=0, keepdims=True)
-
-    return normalized_x
-
-
-def normalize_wrt_ball_approaching_no_player(activation_pairs, ball_approaching):
-    """
-    Normalize activations with respect to the ball position.
-    """
-    indices_approaching = th.where(ball_approaching == 1)
-    indices_not_approaching = th.where(ball_approaching == 0)
-    activations_approaching = normalize(activation_pairs[indices_approaching])
-    activations_not_approaching = normalize(activation_pairs[indices_not_approaching])
-
-    # Place the normalized activations back into the combined arrays
-    combined_activations = th.zeros_like(activation_pairs)
-    combined_activations[indices_approaching] = activations_approaching
-    combined_activations[indices_not_approaching] = activations_not_approaching
-    return combined_activations
-
-
-def normalize_wrt_ball_approaching(activation_pairs, ball_pos_pairs):
-    """
-    Normalize activations with respect to the ball position for each player separately.
-    """
-    indices_player1_left = th.where(ball_pos_pairs[:, 0] == 0)[0]
-    indices_player1_right = th.where(ball_pos_pairs[:, 0] == 1)[0]
-    indices_player2_left = th.where(ball_pos_pairs[:, 1] == 0)[0]
-    indices_player2_right = th.where(ball_pos_pairs[:, 1] == 1)[0]
-    activations_player1_left = normalize(activation_pairs[:, 0][indices_player1_left])
-    activations_player1_right = normalize(activation_pairs[:, 0][indices_player1_right])
-    activations_player2_left = normalize(activation_pairs[:, 1][indices_player2_left])
-    activations_player2_right = normalize(activation_pairs[:, 1][indices_player2_right])
-
-    # Place the normalized activations back into the combined arrays
-    combined_activations_player1 = th.zeros_like(activation_pairs[:, 0])
-    combined_activations_player2 = th.zeros_like(activation_pairs[:, 1])
-    combined_activations_player1[indices_player1_left] = activations_player1_left
-    combined_activations_player1[indices_player1_right] = activations_player1_right
-    combined_activations_player2[indices_player2_left] = activations_player2_left
-    combined_activations_player2[indices_player2_right] = activations_player2_right
-    return th.stack((combined_activations_player1, combined_activations_player2), dim=1)
-
-
 class Probe(nn.Module):
     def __init__(self):
         super().__init__()
@@ -139,6 +88,7 @@ class CCS:
         seed=SEED,
         load=True,
         linear=True,
+        normalize=False,
     ):
         self.env = env
         self.model = model
@@ -197,7 +147,7 @@ class CCS:
             val_fraction,
             gamma,
             seed,
-            normalize=False,
+            normalize=normalize,
         )
 
     def initialize_probe(self):

@@ -108,6 +108,12 @@ def parse_args():
         default=False,
         action="store_true",
     )
+    ccs_group.add_argument(
+        "--normalize",
+        help="Whether to normalize the activations wrt the ball approaching",
+        action="store_true",
+        default=False,
+    )
 
     vis_group = parser.add_argument_group(
         "Visualization", "Parameters for the probe visualization across time"
@@ -242,6 +248,7 @@ if __name__ == "__main__":
                     load=args.load_best_probe,
                     linear=args.linear,
                     # verbose=True,
+                    normalize=args.normalize,
                 )
                 if ccs.best_probe is None:
                     ccs.repeated_train(save=args.save_probe)

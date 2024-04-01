@@ -165,13 +165,13 @@ def calculate_returns(reward_pairs, gamma=0.99):
     return th.tensor(return_pairs)
 
 
-def normalize(self, activations):
+def normalize(activations, var_normalize=False):
     """
     Mean-normalizes the data x (of shape (n, d))
-    If self.var_normalize, also divides by the standard deviation
+    If var_normalize, also divides by the standard deviation
     """
     normalized_x = activations - activations.mean(axis=0, keepdims=True)
-    if self.var_normalize:
+    if var_normalize:
         normalized_x /= normalized_x.std(axis=0, keepdims=True)
 
     return normalized_x
